@@ -207,3 +207,23 @@ compiler inputs and optional incremental witnesses. They are diagnostic records,
 not a guarantee that an arbitrary workload or cache deployment has been tested.
 The older unit-graph inspection/execution commands have their own contracts and
 remain documented separately in the repository README.
+
+== Native builder-RPC integration boundary
+
+The 6 October GammaLoop probe validates the existing unit-graph executor's
+`CARGO_DYNDRV_IN_DRV`/`SubmitOutput` route on pinned upstream Nix
+`2.36.0pre20261005_bea853d`. A parent builder generates derivations in its
+serving Nix store, which then builds two real Rust crates. No additional store or
+daemon is created inside that builder. An exact repeat starts zero builders;
+changing the application recompiles it and reuses the unchanged library's exact
+output. Incremental compilation is disabled in this fixture.
+
+This route differs from the Cargo-driven backend documented above. The
+restricted builder interface publishes objects and outputs but rejects ordinary
+`nix build` requests. Changing the backend's socket or Nix executable alone
+therefore does not migrate its synchronous compiler execution. A native design
+must either qualify the separate unit-graph executor for the full workload or
+retain one Cargo compilation owner and publish its completed artifacts/state
+directly. Required-suite equivalence, pipelining, changed-crate incremental
+snapshots and cache delivery remain unverified on this native route. The probe
+records are under `/tmp/ci-clean-sheet-research/native-dyndrv-nix-01/`.
