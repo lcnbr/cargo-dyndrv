@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["source-wrap", "compile-wrap", "build-wrap","cargo-dyndrv", "env-wrap", "target-env", "compiler-recipe"]

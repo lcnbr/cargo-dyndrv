@@ -1,0 +1,205 @@
+{
+  "version": 4,
+  "roots": [
+    0
+  ],
+  "units": [
+    {
+      "pkg_id": "path+file:///fixture#sample@0.1.0",
+      "target": {
+        "kind": [
+          "lib"
+        ],
+        "crate_types": [
+          "lib"
+        ],
+        "name": "sample",
+        "src_path": "/fixture/src/lib.rs",
+        "edition": "2024",
+        "doc": true,
+        "doctest": true,
+        "test": true
+      },
+      "profile": {
+        "name": "dev",
+        "opt_level": "0",
+        "lto": "false",
+        "codegen_backend": null,
+        "codegen_units": null,
+        "debuginfo": 0,
+        "split_debuginfo": null,
+        "debug_assertions": true,
+        "overflow_checks": true,
+        "rpath": false,
+        "incremental": false,
+        "panic": "unwind"
+      },
+      "platform": null,
+      "mode": "build",
+      "features": [],
+      "dependencies": [],
+      "rustflags": [],
+      "extra_compiler_args": null,
+      "resolved_rustc_recipe": {
+        "status": "resolved",
+        "recipe": {
+          "version": 1,
+          "platform": "x86_64-unknown-linux-gnu",
+          "unit": 0,
+          "program": {
+            "binding": "rustc"
+          },
+          "arguments": [
+            {
+              "parts": [
+                {
+                  "literal": [
+                    45,
+                    45,
+                    99,
+                    114,
+                    97,
+                    116,
+                    101,
+                    45,
+                    110,
+                    97,
+                    109,
+                    101
+                  ]
+                }
+              ]
+            },
+            {
+              "parts": [
+                {
+                  "literal": [
+                    115,
+                    97,
+                    109,
+                    112,
+                    108,
+                    101
+                  ]
+                }
+              ]
+            },
+            {
+              "parts": [
+                {
+                  "path": {
+                    "kind": "relative-source",
+                    "unit": 0,
+                    "bytes": [
+                      115,
+                      114,
+                      99,
+                      47,
+                      108,
+                      105,
+                      98,
+                      46,
+                      114,
+                      115
+                    ]
+                  }
+                }
+              ]
+            }
+          ],
+          "cwd": {
+            "kind": "workspace-root"
+          },
+          "environment": {
+            "inherited": {
+              "binding": "execution-environment",
+              "sample": "execution",
+              "policy": "credential-free-explicit-binding-v1"
+            },
+            "preparation_dylib_path": {
+              "binding": "preparation-dylib-path",
+              "sample": "preparation",
+              "variable": "LD_LIBRARY_PATH",
+              "components": 0
+            },
+            "overlay": {
+              "EMPTY": {
+                "set": {
+                  "parts": [
+                    {
+                      "literal": []
+                    }
+                  ]
+                }
+              },
+              "UNSET": {
+                "unset": true
+              }
+            }
+          },
+          "capabilities": {
+            "jobserver": {
+              "binding": "cargo-jobserver",
+              "environment_after_overlay": [
+                "CARGO_MAKEFLAGS"
+              ]
+            },
+            "retry_with_argfile": true,
+            "executor_io": {
+              "stdin": "null",
+              "stdout": "streamed",
+              "stderr": "streamed"
+            },
+            "arg0": "program"
+          },
+          "outputs": [
+            {
+              "index": 0,
+              "path": {
+                "kind": "output-path",
+                "unit": 0,
+                "relative": [
+                  108,
+                  105,
+                  98,
+                  115,
+                  97,
+                  109,
+                  112,
+                  108,
+                  101,
+                  46,
+                  114,
+                  108,
+                  105,
+                  98
+                ]
+              },
+              "flavor": "Linkable",
+              "hardlink": null,
+              "export": null,
+              "presence": "compiler-declaration"
+            }
+          ],
+          "dep_info": {
+            "kind": "output-path",
+            "unit": 0,
+            "relative": [
+              115,
+              97,
+              109,
+              112,
+              108,
+              101,
+              46,
+              100
+            ]
+          },
+          "binding_scope": "native-path-and-environment-equivalence-required",
+          "binding_status": "requires-validated-inputs",
+          "execution_admitted": false
+        }
+      }
+    }
+  ]
+}

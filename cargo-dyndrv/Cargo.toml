@@ -1,0 +1,26 @@
+[package]
+name = "cargo-dyndrv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.12.1"
+cargo_metadata = "0.23.1"
+color-eyre = "0.6.5"
+data-encoding = "2.11.1"
+harmonia-protocol = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
+harmonia-store-aterm = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
+harmonia-store-content-address = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
+harmonia-store-derivation = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
+harmonia-store-path = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
+harmonia-store-remote = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
+harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
+libc = "0.2.189"
+nix-nar = "0.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt", "sync"] }
+which = "8.0.5"
+source-wrap = { path = "../source-wrap" }
+cargo-compiler-recipe = { path = "../compiler-recipe" }
+compile-wrap = { path = "../compile-wrap" }
