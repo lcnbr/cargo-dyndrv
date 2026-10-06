@@ -1,3 +1,4 @@
+mod native_publish;
 mod stock_cargo;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -173,6 +174,9 @@ fn main() -> eyre::Result<()> {
         return result;
     }
     let sys_args: Vec<_> = std::env::args().collect();
+    if sys_args.get(1).is_some_and(|arg| arg == "publish-native") {
+        return native_publish::Publication::cli(&sys_args[2..]);
+    }
     // Planning must work with no Nix daemon, installed wrappers or source imports.
     if sys_args.get(1).is_some_and(|arg| arg == "plan") {
         return plan::cli(&sys_args[2..]);
