@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, LazyLock, OnceLock},
 };
@@ -47,6 +47,37 @@ pub fn daemon_path() -> PathBuf {
     }
 }
 
+pub(crate) fn source_nar(real_path: &Path) -> eyre::Result<Vec<u8>> {
+    // Cargo vendor directories may link the package root into another store path.
+    // Import its contents, not an unreferenced symlink that is broken in the sandbox.
+    // This only resolves the root; nested source symlinks keep NAR's existing behavior.
+    let root = real_path
+        .canonicalize()
+        .wrap_err_with(|| format!("resolving package source root {}", real_path.display()))?;
+    let mut encoder = nix_nar::Encoder::new(&root)?;
+    let mut buf = Vec::new();
+    std::io::copy(&mut encoder, &mut buf)?;
+    Ok(buf)
+}
+
+/// Import the exact source image already validated by a bound graph. No path
+/// reread or root-key cache is involved in this opt-in route.
+pub(crate) async fn add_prepared_nar<T: DaemonStore>(
+    store: &mut T,
+    source_nar: &[u8],
+) -> eyre::Result<StorePath> {
+    Ok(store
+        .add_ca_to_store(
+            "bound-workspace-src",
+            ContentAddressMethodAlgorithm::NixArchive(SHA256),
+            &Default::default(),
+            false,
+            source_nar,
+        )
+        .await?
+        .path)
+}
+
 pub async fn add_to_store_nar<T: DaemonStore>(
     store: &mut T,
     real_path: PathBuf,
@@ -60,9 +91,7 @@ pub async fn add_to_store_nar<T: DaemonStore>(
         Ok(store_path.clone())
     } else {
         // TODO: Don't put the entire nar in memory
-        let mut encoder = nix_nar::Encoder::new(&real_path)?;
-        let mut buf = Vec::new();
-        std::io::copy(&mut encoder, &mut buf)?;
+        let buf = source_nar(&real_path)?;
         let store_path = store
             .add_ca_to_store(
                 name,
@@ -197,4 +226,40 @@ pub async fn target_env_drv<T: DaemonStore>(
     };
 
     add_drv_to_store(store, store_dir, drv, &name).await
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::source_nar;
+    use std::{fs, os::unix::fs::symlink, time::SystemTime};
+
+    #[test]
+    fn vendor_root_symlink_imports_package_contents() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cargo-dyndrv-source-{}-{nonce}",
+            std::process::id()
+        ));
+        let package = root.join("package");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("build.rs"), b"fn main() {}\n").unwrap();
+        let vendor = root.join("vendor-package");
+        symlink(&package, &vendor).unwrap();
+
+        let direct = source_nar(&package).unwrap();
+        assert_eq!(source_nar(&vendor).unwrap(), direct);
+        fs::write(
+            package.join("build.rs"),
+            b"fn main() { println!(\"changed\"); }\n",
+        )
+        .unwrap();
+        assert_ne!(source_nar(&vendor).unwrap(), direct);
+        fs::remove_file(&vendor).unwrap();
+        symlink(root.join("missing"), &vendor).unwrap();
+        assert!(source_nar(&vendor).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -135,12 +135,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cargo-compiler-recipe"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cargo-dyndrv"
 version = "0.1.0"
 dependencies = [
+ "compile-wrap",
  "bytes",
+ "cargo-compiler-recipe",
  "cargo_metadata",
  "color-eyre",
+ "data-encoding",
  "harmonia-protocol",
  "harmonia-store-aterm",
  "harmonia-store-content-address",
@@ -148,9 +160,11 @@ dependencies = [
  "harmonia-store-path",
  "harmonia-store-remote",
  "harmonia-utils-hash",
+ "libc",
  "nix-nar",
  "serde",
  "serde_json",
+ "source-wrap",
  "tokio",
  "which",
 ]
@@ -227,6 +241,10 @@ dependencies = [
  "tracing-core",
  "tracing-error",
 ]
+
+[[package]]
+name = "compile-wrap"
+version = "0.1.0"
 
 [[package]]
 name = "const-oid"
@@ -1132,6 +1150,10 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "source-wrap"
+version = "0.1.0"
 
 [[package]]
 name = "subtle"

@@ -35,7 +35,7 @@
           # For some reason nixpkgs cargo will accept unstable features.
           # If it didn't we could use __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly
           # or cargo (but not rustc) from fenix
-          inherit (pkgs.cargo-dyndrv) BUILD_WRAP ENV_WRAP TARGET_ENV;
+          inherit (pkgs.cargo-dyndrv) BUILD_WRAP COMPILE_WRAP SOURCE_WRAP ENV_WRAP TARGET_ENV;
         };
         cross =
           let
@@ -59,7 +59,7 @@
             "CARGO_TARGET_${pkgs'.stdenv.buildPlatform.rust.cargoEnvVarTarget}_LINKER" = HOST_CC;
             "CARGO_TARGET_${pkgs'.hostPlatform.rust.cargoEnvVarTarget}_LINKER" = lib.getExe pkgs'.stdenv.cc;
 
-            inherit (pkgs'.cargo-dyndrv) BUILD_WRAP ENV_WRAP TARGET_ENV;
+            inherit (pkgs'.cargo-dyndrv) BUILD_WRAP COMPILE_WRAP SOURCE_WRAP ENV_WRAP TARGET_ENV;
           };
       });
 
@@ -72,6 +72,7 @@
             final.buildPackages.buildRustCrate {
               crateName = name;
               version = "0.1.0";
+              edition = (builtins.fromTOML (builtins.readFile ./${name}/Cargo.toml)).package.edition;
               src = ./${name};
               crateBin = [ { inherit name; } ];
             };
@@ -90,6 +91,9 @@
                 ./env-wrap
                 ./target-env
                 ./build-wrap
+                ./compile-wrap
+                ./source-wrap
+                ./compiler-recipe
               ];
             };
             cargoLock = {
@@ -104,6 +108,8 @@
 
             env = {
               BUILD_WRAP = lib.getExe (makeHelper "build-wrap");
+              SOURCE_WRAP = lib.getExe (makeHelper "source-wrap");
+              COMPILE_WRAP = lib.getExe (makeHelper "compile-wrap");
               ENV_WRAP = lib.getExe (makeHelper "env-wrap");
               TARGET_ENV = lib.getExe (makeHelper "target-env");
 

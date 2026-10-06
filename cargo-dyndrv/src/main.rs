@@ -1,14 +1,13 @@
+mod stock_cargo;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Display,
     hash::{Hash, Hasher},
-    path::Path,
     str::FromStr,
     sync::Arc,
 };
 
-use cargo_metadata::MetadataCommand;
-use color_eyre::eyre::{self, ContextCompat, OptionExt as _, WrapErr as _};
+use color_eyre::eyre::{self, OptionExt as _, WrapErr as _};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::{
     derivation::{Derivation, DerivationOutput},
@@ -20,11 +19,17 @@ use harmonia_store_remote::HandshakeDaemonStore as _;
 use harmonia_utils_hash::Algorithm::SHA256;
 
 use crate::{
+    cargo_command::CargoInvocation,
     store::{OUTPUT_FLAGS, OUTPUT_OUT, PLATFORM},
-    unit_graph::{CompileMode, Unit, UnitGraph},
+    unit_graph::{CompileMode, Unit},
     util::{CloneBytes as _, IntoBytes as _},
 };
 
+mod bound_graph;
+mod cargo_command;
+mod package_metadata;
+mod plan;
+mod source;
 mod store;
 mod tools;
 mod unit_graph;
@@ -37,7 +42,7 @@ const SCRIPT_METADATA_ENV: &str = "metadata";
 
 #[derive(Debug, Clone, Default)]
 struct UnitCacheMeta {
-    pub base_name: Option<String>,
+    pub artifacts: Vec<plan::Artifact>,
     pub custom_output: bool,
     pub has_links: bool,
 }
@@ -90,15 +95,11 @@ fn add_codegen<T: Display>(args: &mut VecDeque<bytes::Bytes>, option: &str, valu
     args.push_back(format!("{}={}", option, value).into());
 }
 
-fn add_feature(args: &mut VecDeque<bytes::Bytes>, feature: &str) {
-    args.push_back("--cfg".into());
-    args.push_back(format!("feature=\"{}\"", feature).into());
-}
-
 fn add_metadata_env(
     env: &mut BTreeMap<bytes::Bytes, bytes::Bytes>,
-    meta: &cargo_metadata::Package,
+    record: &package_metadata::PackageRecord,
 ) {
+    let meta = &record.package;
     env.insert("CARGO_PKG_VERSION".into(), meta.version.to_string().into());
     env.insert(
         "CARGO_PKG_VERSION_MAJOR".into(),
@@ -117,52 +118,115 @@ fn add_metadata_env(
         meta.version.pre.as_str().to_owned().into(),
     );
 
-    // TODO: more of these
+    env.insert("CARGO_PKG_NAME".into(), meta.name.to_string().into());
+    env.insert("CARGO_PKG_AUTHORS".into(), meta.authors.join(":").into());
+    for (key, value) in [
+        ("CARGO_PKG_DESCRIPTION", meta.description.as_deref()),
+        ("CARGO_PKG_HOMEPAGE", meta.homepage.as_deref()),
+        ("CARGO_PKG_REPOSITORY", meta.repository.as_deref()),
+        ("CARGO_PKG_LICENSE", meta.license.as_deref()),
+        (
+            "CARGO_PKG_LICENSE_FILE",
+            meta.license_file.as_ref().map(|p| p.as_str()),
+        ),
+        ("CARGO_PKG_README", meta.readme.as_ref().map(|p| p.as_str())),
+    ] {
+        env.insert(key.into(), value.unwrap_or_default().to_owned().into());
+    }
+    env.insert(
+        "CARGO_PKG_RUST_VERSION".into(),
+        record.rust_version_env().to_owned().into(),
+    );
 }
 
-fn extern_declaration(
-    crate_type: &str,
-    extern_crate_name: &str,
-    out_path: &Path,
-    dep_base_name: &str,
-    dep: &Unit,
-) -> eyre::Result<String> {
-    let dep_crate_type = &dep.target.crate_types[0];
-    let needs_rlib = crate_type == "bin" || crate_type == "proc-macro";
-    let extension = if dep_crate_type == "lib" || dep_crate_type == "rlib" {
-        if needs_rlib { ".rlib" } else { ".rmeta" }
-    } else if dep_crate_type == "dylib" || dep_crate_type == "proc-macro" {
-        ".so"
-    } else {
-        ""
-    };
-    Ok(format!(
-        "{}={}/{}{}",
-        extern_crate_name,
-        out_path.to_str().wrap_err("path not valid utf-8")?,
-        dep_base_name,
-        extension,
-    ))
+fn add_build_script_feature_env(
+    env: &mut BTreeMap<bytes::Bytes, bytes::Bytes>,
+    features: &[String],
+) {
+    for feature in features {
+        let feature_name = feature.to_uppercase().replace('-', "_");
+        // Cargo exposes every enabled build-script feature with the value "1".
+        env.insert(format!("CARGO_FEATURE_{}", feature_name).into(), "1".into());
+    }
+}
+
+fn declared_check_cfg_args(features: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    // Cargo checks every declared feature, including disabled and implicit ones.
+    // Package metadata supplies this complete, sorted map; unit.features does not.
+    let values = features
+        .keys()
+        .map(|feature| format!("{feature:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![
+        "--check-cfg".into(),
+        "cfg(docsrs,test)".into(),
+        "--check-cfg".into(),
+        format!("cfg(feature, values({values}))"),
+    ]
+}
+
+fn main() -> eyre::Result<()> {
+    color_eyre::install()?;
+    let native_args = std::env::args_os().collect::<Vec<_>>();
+    if let Some(result) = stock_cargo::dispatch(&native_args) {
+        return result;
+    }
+    let sys_args: Vec<_> = std::env::args().collect();
+    // Planning must work with no Nix daemon, installed wrappers or source imports.
+    if sys_args.get(1).is_some_and(|arg| arg == "plan") {
+        return plan::cli(&sys_args[2..]);
+    }
+    if sys_args
+        .get(1)
+        .is_some_and(|arg| arg == "plan-generated-layout")
+    {
+        return plan::generated_cli(&sys_args[2..]);
+    }
+    match sys_args.get(1).map(String::as_str) {
+        Some("inspect-bound-graph") if sys_args.len() == 4 && sys_args[2] == "--input" => {
+            let bound = bound_graph::load(std::path::Path::new(&sys_args[3]))?;
+            println!("{}", serde_json::to_string_pretty(bound.receipt())?);
+            Ok(())
+        }
+        Some("execute-bound-graph")
+            if sys_args.len() == 6
+                && sys_args[2] == "--input"
+                && sys_args[4] == "--daemon-socket" =>
+        {
+            // All input checks occur before async setup or daemon connection.
+            let bound = bound_graph::load(std::path::Path::new(&sys_args[3]))?;
+            let socket = bound_graph::socket(std::path::Path::new(&sys_args[5]))?;
+            run(sys_args, Some(bound), Some(socket))
+        }
+        Some("inspect-bound-graph" | "execute-bound-graph") => eyre::bail!(
+            "usage: inspect-bound-graph --input FILE | execute-bound-graph --input FILE --daemon-socket PRIVATE_SOCKET"
+        ),
+        _ => run(sys_args, None, None),
+    }
 }
 
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
-    color_eyre::install()?;
-
+async fn run(
+    sys_args: Vec<String>,
+    bound: Option<bound_graph::ValidatedBoundGraph>,
+    explicit_socket: Option<std::path::PathBuf>,
+) -> eyre::Result<()> {
+    let bound_mode = bound.is_some();
     // Someone might want a different one for some reason, idk how to get it
     let store_dir = StoreDir::default();
     let mut store = harmonia_store_remote::DaemonClientBuilder::new()
         .set_store_dir(&store_dir)
-        .build_unix(store::daemon_path())
+        .build_unix(explicit_socket.unwrap_or_else(store::daemon_path))
         .await?
         .handshake()
         .await?;
 
-    let tools = tools::Tools::find(&store_dir)?;
-
     // TODO: accept this via some argument
 
-    let all_extern_config: BTreeMap<String, ExternConfig> = {
+    let all_extern_config: BTreeMap<String, ExternConfig> = if bound_mode {
+        BTreeMap::new()
+    } else {
         let extern_path = std::env::var("EXTERN_PATH").unwrap_or("extern.json".to_string());
 
         if let Ok(content) = std::fs::read_to_string(extern_path) {
@@ -172,38 +236,94 @@ async fn main() -> eyre::Result<()> {
         }
     };
 
-    // Shelling out to `cargo` since the cargo crate does not provide what we need
-    let sys_args: Vec<_> = std::env::args().collect();
+    let (
+        tools,
+        unit_graph,
+        metadata,
+        workspace_source,
+        source_wrapper,
+        bound_plans,
+        bound_nar,
+        diagnostic_probe,
+        bound_package_sources,
+    ) = if let Some(bound) = bound {
+        let bound = bound.into_parts();
+        (
+            bound.tools,
+            bound.graph,
+            bound.metadata,
+            Some(bound.workspace),
+            Some(bound.source_wrapper),
+            Some(bound.plans),
+            Some(bound.source_nar),
+            bound.probe,
+            Some(bound.package_sources),
+        )
+    } else {
+        let tools = tools::Tools::find(&store_dir)?;
+        // Shelling out to `cargo` since the cargo crate does not provide what we need
+        let cargo = CargoInvocation::new(&tools.cargo.real_path, &sys_args[1..]);
+        let unit_graph = crate::unit_graph::discover(&cargo)?;
 
-    let unit_graph = UnitGraph::discover(&tools.cargo.real_path, &sys_args[1..])?;
-
-    // The unit graph doesn't give us everything we want,
-    // but the remainder can come from the packages in `cargo metadata`
-    // The package ids match the unit graph, so we can index on them
-    let package_metadata: HashMap<_, _> = {
-        let mut command = MetadataCommand::new();
-        command.cargo_path(tools.cargo.real_path.clone());
-        let mut idx = 1;
-        loop {
-            if idx >= sys_args.len() - 1 {
-                break;
-            }
-            // TODO: flags
-            if &sys_args[idx] == "-m" || &sys_args[idx] == "--manifest-path" {
-                command.manifest_path(sys_args[idx + 1].clone());
-                idx += 1;
-            }
-            idx += 1;
-        }
-        let metadata = command.exec()?;
-        metadata
-            .packages
-            .into_iter()
-            .map(|package| (package.id.repr.clone(), package))
-            .collect()
+        // The unit graph doesn't give us everything we want,
+        // but the remainder can come from the packages in `cargo metadata`
+        // The package ids match the unit graph, so we can index on them
+        let metadata = cargo.metadata()?;
+        let workspace_source = std::env::var_os("CARGO_DYNDRV_WORKSPACE_SOURCE")
+            .map(|root| {
+                source::WorkspaceSource::new(
+                    std::path::Path::new(&root),
+                    metadata.workspace_root.as_std_path(),
+                    metadata.target_directory.as_std_path(),
+                )
+            })
+            .transpose()?;
+        // Default mode does not require the optional source wrapper.
+        let source_wrapper = workspace_source
+            .as_ref()
+            .map(|_| tools::Tool::find(&store_dir, "source-wrap", option_env!("SOURCE_WRAP")))
+            .transpose()?;
+        (
+            tools,
+            unit_graph,
+            metadata,
+            workspace_source,
+            source_wrapper,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
+    let package_metadata: HashMap<_, _> = metadata
+        .packages
+        .into_iter()
+        .map(|record| (record.package.id.repr.clone(), record))
+        .collect();
+    // Bound mappings were validated with the captured source image. Do not
+    // resolve the mutable source filesystem again after daemon connection.
+    let package_sources: Vec<_> = if let Some(sources) = bound_package_sources {
+        sources
+    } else {
+        unit_graph
+            .units
+            .iter()
+            .map(|unit| {
+                let package = &package_metadata[&unit.pkg_id].package;
+                match (&workspace_source, &package.source) {
+                    (Some(layout), None) => layout
+                        .package(
+                            package.manifest_path.as_std_path(),
+                            unit.target.src_path.as_path(),
+                        )
+                        .map(Some),
+                    _ => Ok(None),
+                }
+            })
+            .collect::<eyre::Result<_>>()?
     };
 
-    if unit_graph.version != 1 {
+    if unit_graph.version != if bound_mode { 2 } else { 1 } {
         eyre::bail!("Unsupported unit graph version {}", unit_graph.version);
     }
 
@@ -219,6 +339,34 @@ async fn main() -> eyre::Result<()> {
         (units, transitive_deps)
     };
 
+    // Reject unsupported compiler semantics before importing any package sources.
+    // This backend currently targets Linux; host/target naming is checked by the
+    // shared planner. Test harness settings need manifest plumbing before tests
+    // may enter this backend.
+    let compiler_plans: Vec<_> = if let Some(plans) = bound_plans {
+        plans.into_iter().map(Some).collect()
+    } else {
+        unit_graph
+            .units
+            .iter()
+            .map(|unit| {
+                if unit.mode == CompileMode::RunCustomBuild {
+                    Ok(None)
+                } else {
+                    plan::compiler_plan(unit, "x86_64-unknown-linux-gnu", None).map(Some)
+                }
+            })
+            .collect::<eyre::Result<_>>()?
+    };
+
+    let workspace_store_source = if let Some(nar) = bound_nar {
+        Some(store::add_prepared_nar(&mut store, &nar).await?)
+    } else if package_sources.iter().any(Option::is_some) {
+        Some(store::add_prepared_nar(&mut store, &workspace_source.as_ref().unwrap().nar()?).await?)
+    } else {
+        None
+    };
+
     let base_env = tools.base_environment();
 
     // TODO: find some way of caching this on disk for interactive builds
@@ -228,7 +376,8 @@ async fn main() -> eyre::Result<()> {
         // TODO: wrap rustc so we can get additional args from
         // build.rs outputs
         let unit = &unit_graph.units[unit_idx];
-        let unit_meta = &package_metadata[&unit.pkg_id];
+        let package_record = &package_metadata[&unit.pkg_id];
+        let unit_meta = &package_record.package;
         let crate_root = unit_meta
             .manifest_path
             .parent()
@@ -236,22 +385,38 @@ async fn main() -> eyre::Result<()> {
 
         let drv_name = crate_root.file_name().ok_or_eyre("empty path")?;
 
-        let src_path = store::add_to_store_nar(
-            &mut store,
-            crate_root.to_path_buf().into(),
-            &format!("{}-src", drv_name),
-        )
-        .await?;
+        let package_source = &package_sources[unit_idx];
+        let src_path = if package_source.is_some() {
+            workspace_store_source.as_ref().unwrap().clone()
+        } else {
+            store::add_to_store_nar(
+                &mut store,
+                crate_root.to_path_buf().into(),
+                &format!("{}-src", drv_name),
+            )
+            .await?
+        };
 
         let mut path: bytes::BytesMut = tools.rustc.path_entry().into();
 
         let mut env = base_env.clone();
         // TODO: more cargo env vars not from cargo metadata
-        add_metadata_env(&mut env, unit_meta);
+        add_metadata_env(&mut env, package_record);
 
+        let manifest_directory = if let Some(package) = package_source {
+            env.insert(
+                "CARGO_MANIFEST_PATH".into(),
+                std::path::Path::new(source::LOGICAL_ROOT)
+                    .join(&package.manifest)
+                    .into_bytes(),
+            );
+            std::path::Path::new(source::LOGICAL_ROOT).join(&package.directory)
+        } else {
+            src_path.to_absolute_path(&store_dir)
+        };
         env.insert(
             "CARGO_MANIFEST_DIR".into(),
-            src_path.to_absolute_path(&store_dir).into_bytes(),
+            manifest_directory.clone().into_bytes(),
         );
 
         let mut inputs = BTreeSet::from([
@@ -259,7 +424,7 @@ async fn main() -> eyre::Result<()> {
             SingleDerivedPath::Opaque(src_path.clone()),
         ]);
 
-        let (drv, meta) = if unit.mode == CompileMode::RunCustomBuild {
+        let (mut drv, meta) = if unit.mode == CompileMode::RunCustomBuild {
             // running build scripts always get HOST_CC/HOST_CXX, but if the target is local
             // (e.g. a build script for a dependency of a build script) its CC will be HOST_CC,
             // not the target CC
@@ -349,7 +514,7 @@ async fn main() -> eyre::Result<()> {
             // build-wrap executable (running inside env-wrap)
             args.push(tools.build_wrap.real_path.clone_bytes());
             // cwd (directory for build.rs exeuction)
-            args.push(src_path.to_absolute_path(&store_dir).into_bytes());
+            args.push(manifest_directory.into_bytes());
             // links_key
             args.push(unit_meta.links.clone().unwrap_or_default().into());
             // flags_dir
@@ -382,10 +547,7 @@ async fn main() -> eyre::Result<()> {
                 }
             }
 
-            for feature in &unit.features {
-                let feature_name = feature.to_uppercase().replace("-", "_");
-                env.insert(format!("CARGO_FEATURE_{}", feature_name).into(), "".into());
-            }
+            add_build_script_feature_env(&mut env, &unit.features);
 
             env.insert("OPT_LEVEL".into(), unit.profile.opt_level.clone().into());
             env.insert("PATH".into(), path.into());
@@ -423,85 +585,64 @@ async fn main() -> eyre::Result<()> {
                 },
             )
         } else {
-            if unit.target.crate_types.len() != 1 {
-                eyre::bail!(
-                    "unit {} has unexpected crate types, {:?}",
-                    unit.pkg_id,
-                    unit.target.crate_types
-                );
-            }
-            let crate_type = &unit.target.crate_types[0];
+            let compiler_plan = compiler_plans[unit_idx]
+                .as_ref()
+                .expect("compiler plan missing");
 
             // nix derivation args start at argv[1], but we put rustc in here anyway.
             // It's easier to add the wrapper if needed
             let mut args = VecDeque::from([tools.rustc.real_path.clone_bytes()]);
+            if let Some(probe) = &diagnostic_probe {
+                // The real compiler remains the declared/bound tool. A separate
+                // diagnostic layer receives that exact path as argv[1].
+                inputs.insert(SingleDerivedPath::Opaque(probe.store_path.clone()));
+                args.push_front(probe.real_path.clone_bytes());
+            }
             {
                 // rustc handles finding other source files for us
-                let crate_relative = unit
-                    .target
-                    .src_path
-                    .strip_prefix(crate_root)
-                    .wrap_err("internal: crate main is not in crate root???")?;
-                let mut path = src_path.to_absolute_path(&store_dir);
-                path.push(crate_relative);
-                args.push_back(path.into_bytes())
+                let input = if let Some(package) = package_source {
+                    package.compiler_input.clone()
+                } else {
+                    let relative = unit
+                        .target
+                        .src_path
+                        .strip_prefix(crate_root)
+                        .wrap_err("internal: crate main is not in crate root???")?;
+                    src_path.to_absolute_path(&store_dir).join(relative)
+                };
+                args.push_back(input.into_bytes())
             }
 
-            add_long(
-                &mut args,
-                "out-dir",
-                &Placeholder::standard_output(&OUTPUT_OUT).render().display(),
+            add_long(&mut args, "out-dir", &compiler_plan.output_directory());
+
+            args.extend(compiler_plan.rustc_args.iter().cloned().map(Into::into));
+
+            args.extend(
+                declared_check_cfg_args(&unit_meta.features)
+                    .into_iter()
+                    .map(Into::into),
             );
 
-            add_long(&mut args, "crate-name", &unit.target.name.replace("-", "_"));
-            add_long(&mut args, "edition", &unit.target.edition);
-            add_long(&mut args, "crate-type", crate_type);
+            if !bound_mode {
+                // TODO: Cargo-configured rustflags
+                // TODO: improve hash calculation
+                let dep_hash = {
+                    let mut hasher = std::hash::DefaultHasher::new();
+                    for direct_dep in &unit.dependencies {
+                        let dep = drv_cache[direct_dep.index].as_ref().unwrap();
+                        Hash::hash(&dep.drv_path, &mut hasher);
+                    }
+                    unit.hash(&mut hasher);
 
-            if unit.mode == CompileMode::Check {
-                add_long(&mut args, "emit", &"metadata");
-            } else if unit.mode == CompileMode::Build {
-                if crate_type == "lib" || crate_type == "rlib" {
-                    add_long(&mut args, "emit", &"metadata,link");
-                } else {
-                    add_long(&mut args, "emit", &"link");
-                }
+                    hasher.finish()
+                };
+                // Notice that there is metadata but no extra-filename.
+                // Since every crate goes in its own derivation with its own output directory,
+                // there is no chance filenames will ever conflict.
+                // Symbol names, on the other hand, are linked into the same binary,
+                // so metadata is required to prevent linking conflicts.
+                add_codegen(&mut args, "metadata", &format_args!("{:016x}", dep_hash));
             }
-
-            add_codegen(&mut args, "debuginfo", &unit.profile.debuginfo);
-
-            add_codegen(&mut args, "opt-level", &unit.profile.opt_level);
-
-            // TODO: embed-bitcode, lto
-            // TODO: check-cfg
-            // TODO: improve hash calculation
-            let dep_hash = {
-                let mut hasher = std::hash::DefaultHasher::new();
-                for direct_dep in &unit.dependencies {
-                    let dep = drv_cache[direct_dep.index].as_ref().unwrap();
-                    Hash::hash(&dep.drv_path, &mut hasher);
-                }
-                unit.hash(&mut hasher);
-
-                hasher.finish()
-            };
-            // Notice that there is metadata but no extra-filename.
-            // Since every crate goes in its own derivation with its own output directory,
-            // there is no chance filenames will ever conflict.
-            // Symbol names, on the other hand, are linked into the same binary,
-            // so metadata is required to prevent linking conflicts.
-            add_codegen(&mut args, "metadata", &format_args!("{:016x}", dep_hash));
-            let base_name = if crate_type == "lib" || crate_type == "proc-macro" {
-                // cargo uses rustc outputs to learn rmeta locations.
-                // we don't have that luxury, but the default path is documented.
-                Some(format!("lib{}", unit.target.name))
-            } else {
-                None
-            };
-
-            for feature in &unit.features {
-                add_feature(&mut args, feature);
-            }
-
             for transitive_dep in &transitive_deps[&unit_idx] {
                 let dep = drv_cache[*transitive_dep].as_ref().unwrap();
                 // Needed for either library deps or OUT_PATH
@@ -534,16 +675,15 @@ async fn main() -> eyre::Result<()> {
 
                 let out = Placeholder::ca_output(&dep.drv_path, &OUTPUT_OUT).render();
 
-                if let Some(dep_base_name) = dep.meta.base_name.as_ref() {
+                if !dep.meta.custom_output {
+                    let artifact = plan::dependency_artifact(compiler_plan, &dep.meta.artifacts)?;
                     args.push_back("--extern".into());
                     args.push_back(
-                        extern_declaration(
-                            crate_type,
-                            &direct_dep.extern_crate_name,
-                            &out,
-                            dep_base_name,
-                            &unit_graph.units[direct_dep.index],
-                        )?
+                        format!(
+                            "{}={}",
+                            direct_dep.extern_crate_name,
+                            out.join(&artifact.file_name).display()
+                        )
                         .into(),
                     );
                 }
@@ -563,10 +703,6 @@ async fn main() -> eyre::Result<()> {
                 }
             }
 
-            if let Some(ref target) = unit.platform {
-                add_long(&mut args, "target", target);
-            }
-
             {
                 // rustc doesn't respect CC environment variable
                 // unix-like platforms use cc as linker
@@ -577,17 +713,18 @@ async fn main() -> eyre::Result<()> {
                     &tools.host_cc
                 };
 
+                cc.bind_linker(&compiler_plan.rustc_args, &mut args)?;
                 inputs.insert(SingleDerivedPath::Opaque(cc.store_path.clone()));
-                add_codegen(&mut args, "linker", &cc.real_path.display());
             }
-            // internal to rustc, but required
-            if crate_type == "proc-macro" {
-                args.push_back("--extern".into());
-                args.push_back("proc_macro".into());
-            }
-
             env.insert("PATH".into(), path.into());
-            let builder = args.pop_front().unwrap();
+            // Wrap the complete existing command, including build-script env-wrap
+            // layers. Only successful compiler outputs enter the public output.
+            inputs.insert(SingleDerivedPath::Opaque(
+                tools.compile_wrap.store_path.clone(),
+            ));
+            args.push_front(Placeholder::standard_output(&OUTPUT_OUT).into_bytes());
+            args.push_front(compiler_plan.output_directory().into());
+            let builder = tools.compile_wrap.real_path.clone_bytes();
             (
                 Derivation {
                     name: StorePathName::from_str(drv_name).wrap_err("invalid derivation name")?,
@@ -607,11 +744,24 @@ async fn main() -> eyre::Result<()> {
                     structured_attrs: None,
                 },
                 UnitCacheMeta {
-                    base_name,
+                    artifacts: compiler_plan.artifacts.clone(),
                     ..Default::default()
                 },
             )
         };
+
+        if package_source.is_some() {
+            let wrapper = source_wrapper.as_ref().unwrap();
+            drv.inputs
+                .insert(SingleDerivedPath::Opaque(wrapper.store_path.clone()));
+            let mut args = vec![
+                src_path.to_absolute_path(&store_dir).into_bytes(),
+                drv.builder,
+            ];
+            args.extend(drv.args);
+            drv.builder = wrapper.real_path.clone_bytes();
+            drv.args = args;
+        }
 
         let drv_path = store::add_drv_to_store(&mut store, &store_dir, drv, drv_name).await?;
         drv_cache[unit_idx] = Some(UnitCache { drv_path, meta });
@@ -632,4 +782,395 @@ async fn main() -> eyre::Result<()> {
     // attach to output if we are inside a derivation.
 
     Ok(())
+}
+
+#[cfg(test)]
+mod check_cfg_tests {
+    use super::declared_check_cfg_args;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn declared_features_include_disabled_implicit_and_unicode_names() {
+        let features = BTreeMap::from([
+            ("disabled".into(), Vec::new()),
+            ("optional-dep".into(), vec!["dep:optional-dep".into()]),
+            ("a+b.c".into(), Vec::new()),
+            ("Δ".into(), Vec::new()),
+        ]);
+        assert_eq!(
+            declared_check_cfg_args(&features),
+            [
+                "--check-cfg",
+                "cfg(docsrs,test)",
+                "--check-cfg",
+                "cfg(feature, values(\"a+b.c\", \"disabled\", \"optional-dep\", \"Δ\"))"
+            ]
+        );
+        assert_eq!(
+            declared_check_cfg_args(&BTreeMap::new())[3],
+            "cfg(feature, values())"
+        );
+    }
+}
+
+#[cfg(test)]
+mod feature_env_tests {
+    use super::add_build_script_feature_env;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn empty_feature_set_preserves_other_environment() {
+        let mut env = BTreeMap::from([("KEEP".into(), "value".into())]);
+        let original = env.clone();
+        add_build_script_feature_env(&mut env, &[]);
+        assert_eq!(env, original);
+    }
+
+    #[test]
+    fn enabled_feature_overrides_prior_value_without_adding_disabled_features() {
+        let mut env = BTreeMap::from([("CARGO_FEATURE_PROBE".into(), "external".into())]);
+        add_build_script_feature_env(&mut env, &["probe".into()]);
+        assert_eq!(
+            env,
+            BTreeMap::from([("CARGO_FEATURE_PROBE".into(), "1".into())])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actual_child_reads_cargo_feature_values_from_production_owner() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt, process::Command};
+        let mut env = BTreeMap::from([("KEEP".into(), "unchanged".into())]);
+        add_build_script_feature_env(
+            &mut env,
+            &["default".into(), "probe".into(), "hyphen-feature".into()],
+        );
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"printf '%s\000' "$CARGO_FEATURE_DEFAULT" "$CARGO_FEATURE_PROBE" "$CARGO_FEATURE_HYPHEN_FEATURE" "$KEEP" "${CARGO_FEATURE_DISABLED+set}""#)
+            .env_clear()
+            .envs(env.into_iter().map(|(key, value)| (OsString::from_vec(key.to_vec()), OsString::from_vec(value.to_vec()))))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            output.stdout,
+            [b"1\0".as_slice(), b"1\0", b"1\0", b"unchanged\0\0"].concat()
+        );
+    }
+}
+
+#[cfg(test)]
+mod package_env_tests {
+    use super::add_metadata_env;
+    use std::collections::BTreeMap;
+
+    const KEYS: [&str; 14] = [
+        "CARGO_PKG_NAME",
+        "CARGO_PKG_AUTHORS",
+        "CARGO_PKG_DESCRIPTION",
+        "CARGO_PKG_HOMEPAGE",
+        "CARGO_PKG_REPOSITORY",
+        "CARGO_PKG_LICENSE",
+        "CARGO_PKG_LICENSE_FILE",
+        "CARGO_PKG_README",
+        "CARGO_PKG_VERSION",
+        "CARGO_PKG_VERSION_MAJOR",
+        "CARGO_PKG_VERSION_MINOR",
+        "CARGO_PKG_VERSION_PATCH",
+        "CARGO_PKG_VERSION_PRE",
+        "CARGO_PKG_RUST_VERSION",
+    ];
+
+    fn package(extra: serde_json::Value) -> crate::package_metadata::PackageRecord {
+        let mut value = serde_json::json!({
+            "name":"minimal-name", "version":"1.2.3-alpha.1+build.5",
+            "id":"path+file:///fixture#minimal-name@1.2.3-alpha.1+build.5",
+            "manifest_path":"/fixture/Cargo.toml", "targets":[],
+            "dependencies":[], "features":{}
+        });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let document = serde_json::json!({"packages":[value],"workspace_members":[],"workspace_root":"/fixture","target_directory":"/fixture/target","version":1,"resolve":null});
+        crate::package_metadata::Metadata::from_slice(&serde_json::to_vec(&document).unwrap())
+            .unwrap()
+            .packages
+            .remove(0)
+    }
+
+    #[test]
+    fn minimal_package_sets_empty_optional_values_and_preserves_precedence() {
+        let meta = package(serde_json::json!({}));
+        let mut env = BTreeMap::from([
+            ("KEEP".into(), "unchanged".into()),
+            ("CARGO_PKG_NAME".into(), "stale".into()),
+            (
+                "CARGO_PKG_RUST_VERSION".into(),
+                "unrelated-existing-value".into(),
+            ),
+        ]);
+        add_metadata_env(&mut env, &meta);
+        let expected = [
+            "minimal-name",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "1.2.3-alpha.1+build.5",
+            "1",
+            "2",
+            "3",
+            "alpha.1",
+            "",
+        ];
+        for (key, value) in KEYS.into_iter().zip(expected) {
+            assert_eq!(env[key.as_bytes()].as_ref(), value.as_bytes(), "{key}");
+        }
+        assert_eq!(env.len(), 15);
+        assert_eq!(env[b"KEEP".as_slice()], "unchanged");
+        assert_eq!(env[b"CARGO_PKG_RUST_VERSION".as_slice()], "");
+        assert!(!env.contains_key(b"CARGO_PKG_DOCUMENTATION".as_slice()));
+    }
+
+    #[test]
+    fn populated_and_distinct_packages_keep_exact_text_and_paths() {
+        let populated = package(serde_json::json!({
+            "name":"other-package", "authors":["A:one", "Δ two"],
+            "description":" leading\ntext ", "homepage":"https://example.test/home",
+            "repository":"https://example.test/repo", "license":"MIT OR Apache-2.0",
+            "license_file":"../licenses/custom file", "readme":"./read me.md",
+            "rust_version":"1.60"
+        }));
+        let mut env = BTreeMap::new();
+        add_metadata_env(&mut env, &populated);
+        for (key, value) in [
+            ("CARGO_PKG_NAME", "other-package"),
+            ("CARGO_PKG_AUTHORS", "A:one:Δ two"),
+            ("CARGO_PKG_DESCRIPTION", " leading\ntext "),
+            ("CARGO_PKG_HOMEPAGE", "https://example.test/home"),
+            ("CARGO_PKG_REPOSITORY", "https://example.test/repo"),
+            ("CARGO_PKG_LICENSE", "MIT OR Apache-2.0"),
+            ("CARGO_PKG_LICENSE_FILE", "../licenses/custom file"),
+            ("CARGO_PKG_README", "./read me.md"),
+        ] {
+            assert_eq!(env[key.as_bytes()].as_ref(), value.as_bytes(), "{key}");
+        }
+        assert_eq!(env[b"CARGO_PKG_RUST_VERSION".as_slice()], "1.60");
+        let explicit_patch = package(serde_json::json!({"rust_version":"1.60.0"}));
+        assert_eq!(
+            populated.package.rust_version,
+            explicit_patch.package.rust_version
+        );
+        let mut explicit_env = BTreeMap::new();
+        add_metadata_env(&mut explicit_env, &explicit_patch);
+        assert_eq!(explicit_env[b"CARGO_PKG_RUST_VERSION".as_slice()], "1.60.0");
+        add_metadata_env(&mut env, &package(serde_json::json!({})));
+        assert_eq!(env[b"CARGO_PKG_NAME".as_slice()], "minimal-name");
+        assert_eq!(env[b"CARGO_PKG_AUTHORS".as_slice()], "");
+        assert_eq!(env[b"CARGO_PKG_README".as_slice()], "");
+        assert_eq!(env.len(), 14);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_cargo_metadata_env_macro_and_child_agree_with_package_owner() {
+        use std::{
+            ffi::OsString,
+            fs,
+            os::unix::ffi::OsStringExt,
+            path::PathBuf,
+            process::{Command, Output},
+            time::{Instant, SystemTime, UNIX_EPOCH},
+        };
+        let parent = std::env::var_os("CARGO_DYNDRV_PACKAGE_TEST_ROOT");
+        let preserve = parent.is_some();
+        let root = parent
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "package-env-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir(&root).unwrap();
+        let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap());
+        let rustc =
+            which::which(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into())).unwrap();
+        let tool_path = std::env::var_os("PATH").unwrap();
+        let linker = std::env::var_os("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER");
+        let mut receipts = Vec::new();
+        let mut run = |name: &str, command: &mut Command, case: &std::path::Path| -> Output {
+            let now = Instant::now();
+            let output = command.output().unwrap();
+            fs::write(case.join(format!("{name}.stdout")), &output.stdout).unwrap();
+            fs::write(case.join(format!("{name}.stderr")), &output.stderr).unwrap();
+            receipts.push(serde_json::json!({"name":name,"case":case,"program":command.get_program(),"argv":command.get_args().collect::<Vec<_>>(),"seconds":now.elapsed().as_secs_f64(),"exitCode":output.status.code()}));
+            fs::write(
+                root.join("commands.json"),
+                serde_json::to_vec_pretty(&receipts).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        let expressions = KEYS.map(|key| format!("env!(\"{key}\")")).join(",");
+        let names = KEYS.map(|key| format!("\"{key}\"")).join(",");
+        let source = format!(
+            "use std::io::Write;fn main(){{let compile=[{expressions}];let keys=[{names}];let runtime=std::env::args().nth(1).as_deref()==Some(\"runtime\");for(i,key)in keys.iter().enumerate(){{let value=if runtime{{std::env::var(key).unwrap()}}else{{compile[i].to_owned()}};std::io::stdout().write_all(value.as_bytes()).unwrap();std::io::stdout().write_all(&[0]).unwrap();}}}}"
+        );
+        for (name, inherited, fields) in [
+            ("minimal", false, ""),
+            (
+                "populated",
+                false,
+                "rust-version=\"1.85\"\nauthors=[\"A:one\",\"Δ two\"]\ndescription=\" leading text \"\nhomepage=\"https://example.test/home\"\nrepository=\"https://example.test/repo\"\nlicense=\"MIT\"\nlicense-file=\"custom license\"\nreadme=\"read me.md\"\n",
+            ),
+            (
+                "inherited",
+                true,
+                "rust-version.workspace=true\nauthors.workspace=true\ndescription.workspace=true\nhomepage.workspace=true\nrepository.workspace=true\nlicense.workspace=true\nlicense-file.workspace=true\nreadme.workspace=true\n",
+            ),
+        ] {
+            let case = root.join(name);
+            fs::create_dir(&case).unwrap();
+            let crate_dir = if inherited {
+                let dir = case.join("member");
+                fs::create_dir(&dir).unwrap();
+                dir
+            } else {
+                case.clone()
+            };
+            if inherited {
+                fs::write(case.join("Cargo.toml"), "[workspace]\nmembers=[\"member\"]\nresolver=\"3\"\n[workspace.package]\nrust-version=\"1.85.0\"\nauthors=[\"Workspace author\"]\ndescription=\"Inherited text\"\nhomepage=\"https://example.test/ws\"\nrepository=\"https://example.test/ws-repo\"\nlicense=\"Apache-2.0\"\nlicense-file=\"ROOT-LICENSE\"\nreadme=\"ROOT-README.md\"\n").unwrap();
+                fs::write(case.join("ROOT-LICENSE"), "fixture license").unwrap();
+                fs::write(case.join("ROOT-README.md"), "fixture readme").unwrap();
+            }
+            fs::create_dir(crate_dir.join("src")).unwrap();
+            fs::write(crate_dir.join("src/main.rs"), &source).unwrap();
+            fs::write(crate_dir.join("Cargo.toml"), format!("[package]\nname=\"package-{name}\"\nversion=\"1.2.3-alpha.1\"\nedition=\"2024\"\n{fields}{}", if inherited {""} else {"[workspace]\n"})).unwrap();
+            if name == "minimal" {
+                fs::write(crate_dir.join("README.md"), "default readme fixture").unwrap();
+            }
+            if name == "populated" {
+                for file in ["custom license", "read me.md"] {
+                    fs::write(crate_dir.join(file), "fixture").unwrap();
+                }
+            }
+            fs::write(case.join("Cargo.lock"), format!("version = 4\n[[package]]\nname = \"package-{name}\"\nversion = \"1.2.3-alpha.1\"\n")).unwrap();
+            fs::create_dir(case.join("home")).unwrap();
+            fs::create_dir(case.join("cargo-home")).unwrap();
+            let clean = |program: &std::path::Path| {
+                let mut command = Command::new(program);
+                command
+                    .env_clear()
+                    .current_dir(&case)
+                    .env("HOME", case.join("home"))
+                    .env("CARGO_HOME", case.join("cargo-home"))
+                    .env("PATH", &tool_path)
+                    .env("RUSTC", &rustc)
+                    .env("CARGO_INCREMENTAL", "0")
+                    .env("CARGO_BUILD_JOBS", "1")
+                    .env("CARGO_TARGET_DIR", case.join("target"));
+                if let Some(linker) = &linker {
+                    command.env("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER", linker);
+                }
+                command
+            };
+            let metadata = run(
+                "metadata",
+                clean(&cargo).args([
+                    "metadata",
+                    "--format-version",
+                    "1",
+                    "--no-deps",
+                    "--offline",
+                    "--locked",
+                ]),
+                &case,
+            );
+            let metadata = crate::package_metadata::Metadata::from_slice(&metadata.stdout).unwrap();
+            assert_eq!(metadata.packages.len(), 1);
+            let mut env = BTreeMap::new();
+            add_metadata_env(&mut env, &metadata.packages[0]);
+            assert_eq!(env.len(), 14);
+            if name == "minimal" {
+                assert_eq!(env[b"CARGO_PKG_README".as_slice()], "README.md");
+            }
+            if inherited {
+                assert_eq!(env[b"CARGO_PKG_AUTHORS".as_slice()], "Workspace author");
+                assert_eq!(env[b"CARGO_PKG_README".as_slice()], "../ROOT-README.md");
+                assert_eq!(env[b"CARGO_PKG_LICENSE_FILE".as_slice()], "../ROOT-LICENSE");
+            }
+            run(
+                "cargo-build",
+                clean(&cargo).args(["build", "--offline", "--locked", "-j", "1"]),
+                &case,
+            );
+            let stock = run(
+                "cargo-env-macro",
+                Command::new(case.join(format!("target/debug/package-{name}"))).env_clear(),
+                &case,
+            );
+            let expected = KEYS
+                .iter()
+                .flat_map(|key| {
+                    env[key.as_bytes()]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(0))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(stock.stdout, expected, "{name}");
+            let direct = case.join("direct-env-macro");
+            let mut compile = clean(&rustc);
+            compile
+                .args(["--edition=2024", "-C", "codegen-units=1"])
+                .arg(crate_dir.join("src/main.rs"))
+                .arg("-o")
+                .arg(&direct);
+            if let Some(linker) = &linker {
+                compile
+                    .arg("-C")
+                    .arg(format!("linker={}", linker.to_str().unwrap()));
+            }
+            let environment = env
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        OsString::from_vec(key.to_vec()),
+                        OsString::from_vec(value.to_vec()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            compile.envs(environment.clone());
+            run("direct-compile", &mut compile, &case);
+            let compiled = run("direct-env-macro", Command::new(&direct).env_clear(), &case);
+            assert_eq!(compiled.stdout, stock.stdout, "{name}");
+            let actual_child = run(
+                "direct-child-env",
+                Command::new(&direct)
+                    .arg("runtime")
+                    .env_clear()
+                    .envs(environment),
+                &case,
+            );
+            assert_eq!(actual_child.stdout, stock.stdout, "{name}");
+        }
+        if !preserve {
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }
