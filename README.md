@@ -8,12 +8,15 @@ to Nix and submits them through `builder-rpc-v0`. See the
 [native publication guide](docs/native-publication.typ) for the builder contract
 and the distinction from the private compiler backend below.
 
-This research branch preserves the recovered ITPhlies commit
-`e7d05f8d6bed9a51e5fbb2a2c451ff359a4a0699` and its original three-commit history.
-That history begins at preservation root `df01839e654c6cd1b039ce07f024a13509533fec`;
-its earlier upstream ancestry was not recovered. The original author metadata is
-retained. Historical GammaLoop validation does not establish a performance gain
-or current production readiness.
+This research branch rebases the recovered ITPhlies implementation onto upstream
+`d5245b85f82627fcaf041e2c57c8aeb7d57d20fe`, the latest upstream `main` fetched on
+23 October 2026. The original recovered commit
+`e7d05f8d6bed9a51e5fbb2a2c451ff359a4a0699` and its history remain on the
+[recovery archive branch](https://github.com/lcnbr/cargo-dyndrv/tree/archive/gammaloop-native-state-publisher-2026-10-23).
+That history began at preservation root `df01839e654c6cd1b039ce07f024a13509533fec`;
+the rebase attaches that snapshot's changes to upstream without changing the
+implementation. Historical GammaLoop validation does not establish a performance
+gain or current production readiness.
 
 ## Stock Cargo backend in this fork
 

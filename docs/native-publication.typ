@@ -64,8 +64,16 @@ The original feature commit is
 `e7d05f8d6bed9a51e5fbb2a2c451ff359a4a0699` (6 October 2026), with tree
 `aa137c77564408cf4fbc9f01133f5739a71b7f33`. It was recovered with its Git objects
 from the surviving `dy3ndgh5d5dfgfqqsn56ry71h2gr6l5p-source` snapshot on ITPhlies.
-The retained three-commit history starts at a source-preservation commit and
-does not contain the earlier upstream ancestry.
+The original three-commit history starts at a source-preservation commit and
+does not contain the earlier upstream ancestry. It remains preserved on
+#link("https://github.com/lcnbr/cargo-dyndrv/tree/archive/gammaloop-native-state-publisher-2026-10-23")[the recovery archive branch],
+including the documentation added during recovery.
+
+On 23 October 2026, `gammaloop-native-state-publisher` was rebased onto the latest
+fetched upstream `main`, `d5245b85f82627fcaf041e2c57c8aeb7d57d20fe`. The snapshot
+root becomes an ordinary commit containing its differences from upstream, and
+the later commits are replayed on it. This establishes upstream ancestry while
+preserving the implementation and original author metadata.
 
 The separate GammaLoop integration commit is
 `0ed70c33db5dea5a53b5877f9ed483484ea8cca3`. It adds the opt-in `nativePublisher`
@@ -91,3 +99,8 @@ The initial parallel test run failed in
 with OS error 11 (`WouldBlock`, temporary resource unavailability). Serial
 execution passed. The failure is retained as a known validation limitation;
 recovery did not change the jobserver implementation or establish its cause.
+
+The upstream rebase produced a tree identical to the archived branch before
+these provenance notes were updated. A range comparison also verified that all
+three commits following the snapshot root retained identical patches. Since
+only history and documentation changed, the code checks above were not rerun.
