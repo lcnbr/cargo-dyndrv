@@ -1,5 +1,20 @@
 # cargo-dyndrv
 
+## GammaLoop native publication
+
+The `gammaloop-native-state-publisher` branch includes `publish-native --spec`.
+Cargo owns compilation and tests; the publisher adds completed output directories
+to Nix and submits them through `builder-rpc-v0`. See the
+[native publication guide](docs/native-publication.typ) for the builder contract
+and the distinction from the private compiler backend below.
+
+This research branch preserves the recovered ITPhlies commit
+`e7d05f8d6bed9a51e5fbb2a2c451ff359a4a0699` and its original three-commit history.
+That history begins at preservation root `df01839e654c6cd1b039ce07f024a13509533fec`;
+its earlier upstream ancestry was not recovered. The original author metadata is
+retained. Historical GammaLoop validation does not establish a performance gain
+or current production readiness.
+
 ## Stock Cargo backend in this fork
 
 For the GammaLoop experiment, use the implemented `capture-cargo`, `nix-cargo`
