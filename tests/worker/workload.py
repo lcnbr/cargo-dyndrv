@@ -12,6 +12,8 @@ parser.add_argument("--backend", choices=("cargo", "dyndrv"), default="dyndrv")
 parser.add_argument("--action", required=True)
 parser.add_argument("arguments", nargs=argparse.REMAINDER)
 options = parser.parse_args()
+options.bootstrap = options.bootstrap.resolve()
+workspace = Path(__file__).resolve().parents[2]
 spec = json.loads((options.bootstrap / "environment.json").read_text())
 arguments = options.arguments[1:]
 if options.action in {"test", "list"}:
@@ -51,11 +53,11 @@ else:
         "--bootstrap",
         str(options.bootstrap),
         "--workspace",
-        str(Path.cwd()),
+        str(workspace),
         "--action",
         options.action,
         "--",
         *command,
     ]
-status = subprocess.run(invocation, check=False).returncode
+status = subprocess.run(invocation, cwd=workspace, check=False).returncode
 sys.exit(status if status >= 0 else 128 - status)
