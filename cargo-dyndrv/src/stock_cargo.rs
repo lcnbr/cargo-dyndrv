@@ -51,7 +51,9 @@ impl Session {
         let session = Self {
             version: 1,
             rustdoc: rustdoc.as_os_str().as_bytes().to_vec(),
-            nix: config.map(nix::Prepared::prepare).transpose()?,
+            nix: config
+                .map(|path| nix::Prepared::prepare(path, &root.join("prepare.json")))
+                .transpose()?,
         };
         let mut file = OpenOptions::new()
             .write(true)

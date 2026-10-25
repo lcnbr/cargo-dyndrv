@@ -567,6 +567,8 @@ mod tests {
                 gc_roots: None,
                 source: root.join("source"),
                 package_sources: Vec::new(),
+                package_store_inputs: BTreeMap::new(),
+                layout_environment_names: BTreeSet::new(),
                 target: target.clone(),
                 incremental: true,
                 incremental_observer: false,

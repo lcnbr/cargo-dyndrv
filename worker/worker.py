@@ -79,6 +79,38 @@ def private_directory(path):
         raise ValueError(f"Directory must have mode 0700: {path}")
 
 
+class RunTimings:
+    def __init__(self):
+        self.started = time.monotonic()
+        self.execution_started = None
+        self.phases = {}
+
+    @contextlib.contextmanager
+    def phase(self, name):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.phases[name] = self.phases.get(name, 0.0) + time.monotonic() - started
+
+    def write(self, path, record):
+        finished = time.monotonic()
+        write_json(
+            path,
+            {
+                **record,
+                "seconds": record.get(
+                    "seconds",
+                    finished - self.execution_started
+                    if self.execution_started is not None
+                    else 0.0,
+                ),
+                "total_seconds": finished - self.started,
+                "phase_seconds": self.phases,
+            },
+        )
+
+
 class Daemon:
     """Access a system daemon or own a private same-user daemon."""
 
@@ -361,9 +393,19 @@ class Worker:
         )
         self.private_names = set(self.spec.get("private_environment_names", []))
         self.runtime_names |= self.private_names
-        self.workspace_names = self.spec.get(
-            "workspace_environment_names",
-            ["NEXTEST_WORKSPACE_ROOT", "INSTA_WORKSPACE_ROOT"],
+        self.workspace_names = set(
+            self.spec.get(
+                "workspace_environment_names",
+                ["NEXTEST_WORKSPACE_ROOT", "INSTA_WORKSPACE_ROOT"],
+            )
+        )
+        if overlap := self.workspace_names & self.private_names:
+            raise ValueError(
+                "Workspace environment names cannot be private: "
+                + ", ".join(sorted(overlap))
+            )
+        self.layout_names = self.workspace_names - set(
+            self.spec.get("forward_environment_names", [])
         )
         self.workspace = workspace.resolve()
         self.action = action
@@ -419,9 +461,9 @@ class Worker:
         self.environment = self.spec["environment"].copy()
         # Runtime values are deliberately absent from the compiler policy.
         for name, value in os.environ.items():
-            if (
+            if name not in self.workspace_names and (
                 name in self.runtime_names
-                or name.startswith(self.runtime_prefixes)
+                or name.startswith((*self.runtime_prefixes, "CARGO_PROFILE_"))
                 or name in self.spec.get("forward_environment_names", [])
                 or name
                 in {
@@ -433,7 +475,6 @@ class Worker:
                     "CARGO_INCREMENTAL",
                     "CARGO_BUILD_INCREMENTAL",
                 }
-                or name.startswith("CARGO_PROFILE_")
             ):
                 self.environment[name] = value
         for name in (
@@ -463,6 +504,13 @@ class Worker:
             for name, value in environment.items()
             if name not in self.private_names
         }
+
+    def compiler_environment_name(self, name, runtime_names):
+        # Layout values are rebound before Cargo starts, including names whose
+        # prefixes otherwise classify caller values as runtime-only.
+        return name in self.workspace_names or (
+            name not in runtime_names and not name.startswith(self.runtime_prefixes)
+        )
 
     def vendor_layout(self, vendor, stage):
         """Expose each complete vendored package at a lock-independent path.
@@ -500,6 +548,15 @@ class Worker:
         for package in packages:
             (stage / Path(package["target"]).relative_to(self.logical)).mkdir()
         return configuration, packages
+
+    @staticmethod
+    def package_store_inputs(packages, package_sources):
+        return {
+            package["target"]: package["source"]
+            for package in packages
+            if package["target"] in package_sources
+            and re.fullmatch(r"/nix/store/[^/]+", package["source"])
+        }
 
     def vendor_input(self, lock):
         environment = self.client | {"CARGO_DYNDRV_CARGO_LOCK": str(lock)}
@@ -762,6 +819,7 @@ class Worker:
             )
 
     def run(self):
+        timings = RunTimings()
         actions = {
             "build",
             "run",
@@ -800,7 +858,8 @@ class Worker:
                 env=self.staging_environment(),
             )
             return
-        metadata = self.original_metadata(locate=self.action == "clean")
+        with timings.phase("original_metadata"):
+            metadata = self.original_metadata(locate=self.action == "clean")
         workspace = (
             Path(metadata["root"]).parent
             if self.action == "clean"
@@ -824,7 +883,10 @@ class Worker:
         owner = identity + "/" + policy
         directory = self.state / "workspaces" / identity / policy
         directory.mkdir(parents=True, exist_ok=True)
-        with locked(directory / "workspace.lock") as workspace_lock:
+        with (
+            locked(directory / "workspace.lock") as workspace_lock,
+            contextlib.ExitStack() as cleanup,
+        ):
             in_progress = directory / "in-progress.json"
             if self.action == "clean":
                 shutil.rmtree(directory / "stage" / "target", ignore_errors=True)
@@ -849,8 +911,19 @@ class Worker:
                     "dyndrv target has an interrupted command; run the application's dyndrv clean action before retrying"
                 )
             stage = directory / "stage"
+            target = stage / "target"
+            session = directory / "sessions" / uuid.uuid4().hex
+            record = {
+                "session": str(session),
+                "status": 1,
+                "workspace": str(workspace),
+                "target": str(target),
+                "logical": str(self.logical),
+            }
+            cleanup.callback(timings.write, directory / "last-run.json", record)
             stage.mkdir(exist_ok=True)
-            vendor = self.vendor_input(workspace / "Cargo.lock")
+            with timings.phase("vendor_input"):
+                vendor = self.vendor_input(workspace / "Cargo.lock")
             original_home = Path(
                 os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
             )
@@ -872,7 +945,8 @@ class Worker:
                 env=self.staging_environment(),
                 configurations=candidates,
             )
-            layout = source_layout.prepare(metadata)
+            with timings.phase("source_layout"):
+                layout = source_layout.prepare(metadata)
             cargo_home = stage / "cargo-home"
             cargo_home.mkdir(exist_ok=True)
             configuration = {}
@@ -895,7 +969,10 @@ class Worker:
                     for registry in value.get("registries", {}).values():
                         registry.pop("token", None)
                     merge(configuration, value)
-            vendor_configuration, vendor_packages = self.vendor_layout(vendor, stage)
+            with timings.phase("vendor_layout"):
+                vendor_configuration, vendor_packages = self.vendor_layout(
+                    vendor, stage
+                )
             merge(configuration, vendor_configuration)
             merged = tomli_w.dumps(configuration)
             if (
@@ -903,7 +980,6 @@ class Worker:
                 or (cargo_home / "config.toml").read_text() != merged
             ):
                 (cargo_home / "config.toml").write_text(merged)
-            target = stage / "target"
             target.mkdir(exist_ok=True)
             if (target / ".dyndrv-delivered/rejected").exists():
                 raise ValueError(
@@ -925,7 +1001,6 @@ class Worker:
                 }
             )
             runtime_names = set(self.runtime_names)
-            session = directory / "sessions" / uuid.uuid4().hex
             if self.action == "run":
                 runner = stage / "runtime-runner.py"
                 runner.write_text(
@@ -947,7 +1022,6 @@ class Worker:
                 )
                 runtime_names.add(runner_name)
             session.parent.mkdir(exist_ok=True)
-            evidence = directory / "last-run.json"
             namespace_config = directory / "namespace.json"
             write_json(
                 namespace_config,
@@ -959,7 +1033,7 @@ class Worker:
                     "packages": vendor_packages,
                 },
             )
-            started = time.monotonic()
+            timings.execution_started = time.monotonic()
             status = 1
             with self.daemon.lease() as lease:
                 # A hard-killed parent must not unlock a live Cargo child.
@@ -976,8 +1050,7 @@ class Worker:
                     {
                         path
                         for name, paths in environment_inputs.items()
-                        if name not in runtime_names
-                        and not name.startswith(self.runtime_prefixes)
+                        if self.compiler_environment_name(name, runtime_names)
                         for path in paths
                     }
                 )
@@ -986,7 +1059,8 @@ class Worker:
                 runtime_inputs = sorted(
                     {str(self.bootstrap), str(vendor), *runtime_inputs}
                 )
-                self.daemon.provision(runtime_inputs, owner)
+                with timings.phase("provision"):
+                    self.daemon.provision(runtime_inputs, owner)
                 # Checks/tests also replace the stage's vendor index. Existing
                 # launchers use that same stage, so refresh their package mounts
                 # once the new runtime inputs are available.
@@ -995,21 +1069,22 @@ class Worker:
                     launch = json.loads(launch_config.read_text())
                     launch["packages"] = vendor_packages
                     write_json(launch_config, launch)
-                prepared = json.loads(
-                    self.run_namespace(
-                        namespace_config,
-                        [
-                            self.spec["cargo"],
-                            "metadata",
-                            "--offline",
-                            "--locked",
-                            "--all-features",
-                            "--format-version",
-                            "1",
-                        ],
-                        capture=True,
+                with timings.phase("in_namespace_metadata"):
+                    prepared = json.loads(
+                        self.run_namespace(
+                            namespace_config,
+                            [
+                                self.spec["cargo"],
+                                "metadata",
+                                "--offline",
+                                "--locked",
+                                "--all-features",
+                                "--format-version",
+                                "1",
+                            ],
+                            capture=True,
+                        )
                     )
-                )
                 packages = set(layout["package_sources"])
                 for package in prepared["packages"]:
                     if package["source"] is not None:
@@ -1026,8 +1101,8 @@ class Worker:
                 }
                 omitted = sorted(
                     name
-                    for name in self.environment
-                    if name in runtime_names or name.startswith(self.runtime_prefixes)
+                    for name in self.environment.keys() | runtime_names
+                    if not self.compiler_environment_name(name, runtime_names)
                 )
                 # The empty prefix admits Cargo and build-script compiler inputs.
                 # Explicit omissions take precedence in the patched driver.
@@ -1040,6 +1115,9 @@ class Worker:
                     "target": str(self.logical / "target"),
                     "inputs": sorted({*self.spec["inputs"], *extra_inputs}),
                     "package_sources": sorted(packages),
+                    "package_store_inputs": self.package_store_inputs(
+                        vendor_packages, packages
+                    ),
                     "incremental": True,
                     "incremental_observer": os.environ.get(
                         "CARGO_DYNDRV_OBSERVE_INCREMENTAL"
@@ -1047,7 +1125,8 @@ class Worker:
                     == "1",
                     "environment_names": [],
                     "environment_prefixes": [""],
-                    "omitted_environment_names": sorted(set(omitted) | runtime_names),
+                    "layout_environment_names": sorted(self.layout_names),
+                    "omitted_environment_names": omitted,
                 }
                 if self.daemon.mode == "system":
                     roots = self.state / "roots" / owner
@@ -1077,38 +1156,44 @@ class Worker:
                 print(f"dyndrv session: {session}", file=sys.stderr)
                 write_json(in_progress, {"session": str(session)})
                 try:
-                    self.run_namespace(namespace_config, command)
-                    self.run_post_commands(namespace_config, layout)
+                    with timings.phase("driver"):
+                        self.run_namespace(namespace_config, command)
+                    with timings.phase("post_commands"):
+                        self.run_post_commands(namespace_config, layout)
                     references = directory / ("references-" + session.name + ".json")
-                    self.run_namespace(
-                        namespace_config,
-                        [
-                            self.spec["driver"],
-                            "snapshot-references",
-                            "--directory",
-                            str(session),
-                            "--output",
-                            str(references),
-                        ],
-                    )
-                    self.daemon.retain(
-                        sorted(
-                            set(json.loads(references.read_text())["storePaths"])
-                            | set(runtime_inputs)
-                        ),
-                        owner,
-                        replace=True,
-                    )
+                    with timings.phase("snapshot_references"):
+                        self.run_namespace(
+                            namespace_config,
+                            [
+                                self.spec["driver"],
+                                "snapshot-references",
+                                "--directory",
+                                str(session),
+                                "--output",
+                                str(references),
+                            ],
+                        )
+                    with timings.phase("retain"):
+                        self.daemon.retain(
+                            sorted(
+                                set(json.loads(references.read_text())["storePaths"])
+                                | set(runtime_inputs)
+                            ),
+                            owner,
+                            replace=True,
+                        )
                     in_progress.unlink(missing_ok=True)
                     if self.action in {"build", "run"}:
-                        self.install_binaries(
-                            metadata, directory, target, namespace_config
-                        )
+                        with timings.phase("install_binaries"):
+                            self.install_binaries(
+                                metadata, directory, target, namespace_config
+                            )
                     status = 0
                 except subprocess.CalledProcessError as error:
                     status = error.returncode
                     try:
-                        self.retain_failed(session, target, owner)
+                        with timings.phase("retain"):
+                            self.retain_failed(session, target, owner)
                         in_progress.unlink(missing_ok=True)
                     except (
                         OSError,
@@ -1142,16 +1227,9 @@ class Worker:
                     )
                     raise
                 finally:
-                    write_json(
-                        evidence,
-                        {
-                            "session": str(session),
-                            "status": status,
-                            "seconds": time.monotonic() - started,
-                            "workspace": str(workspace),
-                            "target": str(target),
-                            "logical": str(self.logical),
-                        },
+                    record.update(
+                        status=status,
+                        seconds=time.monotonic() - timings.execution_started,
                     )
                     if self.action == "doc" and status == 0:
                         docs = target / "doc"

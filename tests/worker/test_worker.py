@@ -37,8 +37,17 @@ class WorkerPolicyTests(unittest.TestCase):
                         "vendor_expression": "configured vendor expression",
                         "nix": "/nix/store/fixture-nix/bin/nix",
                         "private_environment_names": ["PRIVATE_TOKEN"],
+                        "runtime_environment_names": ["NEXTEST_WORKSPACE_ROOT"],
                         "runtime_environment_prefixes": ["APP_RUNTIME_"],
-                        "forward_environment_names": ["APP_COMPILER_FLAG"],
+                        "workspace_environment_names": [
+                            "NEXTEST_WORKSPACE_ROOT",
+                            "INSTA_WORKSPACE_ROOT",
+                            "APP_RUNTIME_WORKSPACE",
+                        ],
+                        "forward_environment_names": [
+                            "APP_COMPILER_FLAG",
+                            "APP_RUNTIME_WORKSPACE",
+                        ],
                     }
                 )
             )
@@ -48,6 +57,10 @@ class WorkerPolicyTests(unittest.TestCase):
                 "PRIVATE_TOKEN": "runtime-only",
                 "APP_RUNTIME_VALUE": "runtime",
                 "APP_COMPILER_FLAG": "compiler",
+                "INSTA_WORKSPACE_ROOT": "/caller/physical/workspace",
+                "NEXTEST_WORKSPACE_ROOT": "/caller/physical/workspace",
+                "APP_RUNTIME_WORKSPACE": "/caller/physical/workspace",
+                "INSTA_UPDATE": "always",
                 "UNRELATED_VALUE": "ignored",
             }
             with (
@@ -61,6 +74,23 @@ class WorkerPolicyTests(unittest.TestCase):
             self.assertEqual(runner.environment["APP_RUNTIME_VALUE"], "runtime")
             self.assertEqual(runner.environment["APP_COMPILER_FLAG"], "compiler")
             self.assertNotIn("UNRELATED_VALUE", runner.environment)
+            self.assertEqual(
+                runner.layout_names, {"INSTA_WORKSPACE_ROOT", "NEXTEST_WORKSPACE_ROOT"}
+            )
+            for name in runner.workspace_names:
+                self.assertNotIn(name, runner.environment)
+                self.assertTrue(
+                    runner.compiler_environment_name(name, runner.runtime_names)
+                )
+            for name in ("PRIVATE_TOKEN", "APP_RUNTIME_VALUE", "INSTA_UPDATE", "HOME"):
+                self.assertFalse(
+                    runner.compiler_environment_name(name, runner.runtime_names)
+                )
+            self.assertTrue(
+                runner.compiler_environment_name(
+                    "APP_COMPILER_FLAG", runner.runtime_names
+                )
+            )
             self.assertIn("PRIVATE_TOKEN", runner.runtime_names)
             self.assertNotIn("PRIVATE_TOKEN", runner.client)
             with mock.patch.object(
@@ -74,6 +104,35 @@ class WorkerPolicyTests(unittest.TestCase):
                 execute.call_args.kwargs["env"]["CARGO_DYNDRV_CARGO_LOCK"],
                 str(root / "Cargo.lock"),
             )
+            specification = json.loads((root / "environment.json").read_text())
+            specification["private_environment_names"].append("INSTA_WORKSPACE_ROOT")
+            (root / "environment.json").write_text(json.dumps(specification))
+            with self.assertRaisesRegex(
+                ValueError, "cannot be private.*INSTA_WORKSPACE_ROOT"
+            ):
+                worker.Worker(root, root, "check", ["check"])
+
+    def test_phase_timings_include_failed_work_and_preserve_execution_seconds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "last-run.json"
+            with mock.patch.object(
+                worker.time, "monotonic", side_effect=[10, 11, 14, 15, 17, 20, 22]
+            ):
+                timings = worker.RunTimings()
+                with (
+                    self.assertRaisesRegex(ValueError, "failed"),
+                    timings.phase("vendor_input"),
+                ):
+                    raise ValueError("failed")
+                with timings.phase("vendor_input"):
+                    pass
+                timings.write(path, {"status": 1, "seconds": 2})
+                report = json.loads(path.read_text())
+                self.assertEqual(report["phase_seconds"], {"vendor_input": 5})
+                self.assertEqual(report["total_seconds"], 10)
+                self.assertEqual(report["seconds"], 2)
+                timings.write(path, {"status": 1})
+                self.assertEqual(json.loads(path.read_text())["seconds"], 0)
 
     def test_post_commands_map_context_and_manifest_and_preserve_failure(self):
         runner = worker.Worker.__new__(worker.Worker)
@@ -201,6 +260,25 @@ class VendorLayoutTests(unittest.TestCase):
         _, packages = self.runner.vendor_layout(vendor, self.stage)
         self.assertEqual(len(packages), 2)
         self.assertNotEqual(packages[0]["target"], packages[1]["target"])
+
+    def test_store_inputs_select_only_whole_mounted_package_roots(self):
+        sources = [
+            "/nix/store/whole-package",
+            "/nix/store/git-checkout/package",
+            "/nix/store/unselected-package",
+            str(self.directory / "mutable-package"),
+        ]
+        packages = [
+            {"source": source, "target": str(self.runner.logical / f"vendor/{index}")}
+            for index, source in enumerate(sources)
+        ]
+        selected = {
+            package["target"] for index, package in enumerate(packages) if index != 2
+        }
+        self.assertEqual(
+            self.runner.package_store_inputs(packages, selected),
+            {packages[0]["target"]: sources[0]},
+        )
 
 
 @unittest.skipUnless(sys.platform == "linux", "The dyndrv worker requires Linux")

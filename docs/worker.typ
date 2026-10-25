@@ -43,14 +43,22 @@ The environment specification contains:
   strips declared private values before invoking Nix. The vendor provider can use
   Crane or another application-selected implementation.
 - `runtime_environment_names` and `runtime_environment_prefixes`: application
-  values forwarded to runtime processes but omitted from compiler requests.
+  values forwarded to runtime processes but omitted from compiler requests,
+  except for the stable layout variables described below.
 - `private_environment_names`: runtime values also excluded from Nix operations
   and metadata discovery. These names automatically join the runtime omission
   policy. Supply credentials at runtime, never in this JSON or a derivation.
 - `forward_environment_names`: additional application-specific compiler inputs.
   Standard Cargo profile, Rust compiler and build-job controls are already handled.
 - `workspace_environment_names`: variables rebound to the staged workspace for
-  runtime tools and exported launchers; defaults are Nextest and Insta roots.
+  Cargo, compiler requests, runtime tools and exported launchers; defaults are
+  `NEXTEST_WORKSPACE_ROOT` and `INSTA_WORKSPACE_ROOT`. These are stable logical
+  layout inputs, even when a runtime name or prefix also matches. Caller physical
+  values are not forwarded to the session. Workspace and private names must be
+  disjoint; overlapping specifications are rejected before staging or Nix access.
+  The backend lists these names in `layout_environment_names` unless also declared
+  in `forward_environment_names`. Descriptive layout values remain compiler
+  request inputs, but their paths alone do not add source roots to a request.
 - `action_executables`: optional application action names mapped to session
   executables, such as a Maturin packaging command. Their arguments are supplied
   unchanged after `--`, with declared manifest paths remapped into the stage.
@@ -95,8 +103,39 @@ Compiler requests retain their owning source root, dependency source roots and
 declared generated/additional inputs. Procedural macros can read their dependency
 assets during downstream expansion. Crates sharing a source root invalidate
 together; implicit undeclared cross-root reads are outside the source contract.
+Stable layout names describe paths and grant no access to undeclared roots.
+Declare cross-root reads through another forwarded path input, or explicitly
+include the layout name in `forward_environment_names` to opt its path into
+additional source-root discovery. Descriptive workspace paths therefore do not
+attach application sources to unrelated registry compiler requests, preserving
+registry reuse after application edits.
 Vendored packages have stable individual logical paths, so an unused lockfile
 addition does not rename another package's compiler source.
+For selected vendored packages whose physical source is exactly a whole
+`/nix/store/<base>` root, the worker supplies `package_store_inputs`, a map from
+logical package path to physical store root. The driver validates store-path
+syntax, mounted directory identity and daemon validity before reusing that
+immutable input. Subdirectories, including packages within Git checkouts, retain
+the existing content snapshot/import path. Namespace mounts remain read-only;
+mutable trees are never cached by modification time.
+
+Staged commands record `last-run.json` once their workspace target passes the
+interrupted-command check. Failures before this point, including initial metadata
+discovery, cannot update the record. `seconds` retains the elapsed interval from
+just before acquiring the daemon lease through execution, retention and launcher
+installation, excluding source/vendor preparation. It is
+zero if that interval was never entered. `total_seconds` measures the worker run
+including metadata discovery, staging, lock waits and report export. Both use a
+monotonic clock. `phase_seconds` contains elapsed seconds for the phases reached:
+`original_metadata`, `vendor_input`, `source_layout` (`SourceLayout.prepare`),
+`vendor_layout`, `provision`, `in_namespace_metadata`, `driver`, `post_commands`,
+`snapshot_references`, `retain` and `install_binaries`. Failed phases include time
+until failure; repeated retention attempts accumulate. Reports also retain partial
+preparation timings on failure once the state directory is known. These phases
+cover their named operations; their sum does not include every setup or export
+step. They contain no environment values. Driver preparation details live in the
+session's `prepare.json`; worker phase boundaries do not infer Cargo start times
+from files left by an incomplete session.
 
 == Qualification
 

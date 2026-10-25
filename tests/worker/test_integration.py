@@ -39,6 +39,7 @@ APPLICATION_LIB = """use support::support;
 use std::env;
 
 fn assert_runtime_environment() {
+{workspace_assertion}
     let names = env::var("CARGO_DYNDRV_TEST_RUNTIME_NAMES").unwrap();
     for name in names.split(',').filter(|name| !name.is_empty()) {
         assert!(!env::var(name).unwrap().is_empty(), "Missing runtime value: {name}");
@@ -123,9 +124,16 @@ class Harness:
             if self.bootstrap
             else {}
         )
-        self.runtime_forbidden = set(policy.get("private_environment_names", [])) | set(
-            policy.get("runtime_environment_names", [])
+        self.workspace_names = set(
+            policy.get(
+                "workspace_environment_names",
+                ["NEXTEST_WORKSPACE_ROOT", "INSTA_WORKSPACE_ROOT"],
+            )
         )
+        self.runtime_forbidden = (
+            set(policy.get("private_environment_names", []))
+            | set(policy.get("runtime_environment_names", []))
+        ) - self.workspace_names
         self.timeout = args.timeout
         self.directory = args.directory.absolute()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -561,7 +569,19 @@ support = { path = "../crates/support" }
             "app/build.rs",
             'fn main() { println!("cargo:rustc-env=ARBITRARY_NEW_COMPILER_VALUE=ok"); }\n',
         )
-        self.write(self.a, "app/src/lib.rs", APPLICATION_LIB)
+        self.write(
+            self.a,
+            "app/src/lib.rs",
+            APPLICATION_LIB.replace(
+                "{workspace_assertion}\n",
+                (
+                    '    let workspace = env::var("INSTA_WORKSPACE_ROOT").expect("Missing workspace layout");\n'
+                    '    assert_eq!(option_env!("INSTA_WORKSPACE_ROOT"), Some(workspace.as_str()));\n'
+                    if "INSTA_WORKSPACE_ROOT" in self.workspace_names
+                    else ""
+                ),
+            ),
+        )
         self.write(self.a, "app/src/main.rs", APPLICATION_MAIN)
         self.write(
             self.a,
@@ -654,6 +674,7 @@ support = { path = "../crates/support" }
         }
         self.require(paths, "No immutable compiler requests found")
         dynamic_value = False
+        workspace_value = False
         for path in paths.values():
             raw = path.read_bytes()
             request = json.loads(raw)
@@ -664,17 +685,27 @@ support = { path = "../crates/support" }
             for name, value in request["environment"]:
                 name, value = bytes(name).decode(), bytes(value)
                 self.require(
-                    name not in self.runtime_forbidden
-                    and not name.startswith(
-                        (
-                            "CARGO_DYNDRV_",
-                            "NEXTEST_",
-                            "INSTA_",
-                            *self.spec.get("runtime_environment_prefixes", []),
+                    name in self.workspace_names
+                    or (
+                        name not in self.runtime_forbidden
+                        and not name.startswith(
+                            (
+                                "CARGO_DYNDRV_",
+                                "NEXTEST_",
+                                "INSTA_",
+                                *self.spec.get("runtime_environment_prefixes", []),
+                            )
                         )
                     ),
                     f"Runtime environment name entered compiler request: {name}",
                 )
+                if name in self.workspace_names:
+                    self.require(
+                        value
+                        == (self.last_run(self.a)["logical"] + "/workspace").encode(),
+                        f"Workspace compiler value is not the stable layout: {name}",
+                    )
+                    workspace_value |= name == "INSTA_WORKSPACE_ROOT"
                 self.require(
                     not any(secret.encode() in value for secret in self.secrets),
                     "Runtime secret value entered compiler request",
@@ -699,6 +730,10 @@ support = { path = "../crates/support" }
         self.require(
             dynamic_value, "Dynamic build-script compiler environment was not captured"
         )
+        if "INSTA_WORKSPACE_ROOT" in self.workspace_names:
+            self.require(
+                workspace_value, "Insta workspace compiler environment was not captured"
+            )
         return len(paths)
 
     def host_bootstrap_root(self, record, label):

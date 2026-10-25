@@ -63,6 +63,10 @@ struct Config {
     source: PathBuf,
     #[serde(default)]
     package_sources: Vec<PathBuf>,
+    #[serde(default)]
+    package_store_inputs: BTreeMap<PathBuf, PathBuf>,
+    #[serde(default)]
+    layout_environment_names: BTreeSet<String>,
     target: PathBuf,
     #[serde(default)]
     incremental: bool,
@@ -502,8 +506,32 @@ impl Prepared {
         Ok(())
     }
 
+    fn bound_store_root(source: &Path, input: &Path) -> eyre::Result<Option<StorePath>> {
+        for path in [source, input] {
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+            {
+                bail!("immutable package binding paths must be normalized and absolute");
+            }
+        }
+        let root = Self::store_path(input)?;
+        if root.to_absolute_path(&StoreDir::default()).as_os_str() != input.as_os_str() {
+            return Ok(None);
+        }
+        let source = fs::metadata(source)?;
+        let input = fs::symlink_metadata(input)?;
+        Ok((source.is_dir()
+            && input.is_dir()
+            && source.dev() == input.dev()
+            && source.ino() == input.ino())
+        .then_some(root))
+    }
+
     #[tokio::main(flavor = "current_thread")]
-    pub(super) async fn prepare(path: &Path) -> eyre::Result<Self> {
+    pub(super) async fn prepare(path: &Path, evidence: &Path) -> eyre::Result<Self> {
+        let started = Instant::now();
         let config: Config = serde_json::from_slice(&fs::read(path)?)?;
         if config.private_target && !config.source_overlay {
             bail!("private target storage requires source overlays");
@@ -557,14 +585,18 @@ impl Prepared {
         if references.is_empty() {
             bail!("explicit compiler and builder runtime inputs required")
         }
+        let handshake_started = Instant::now();
         let mut daemon = harmonia_store_remote::DaemonClientBuilder::new()
             .set_store_dir(&store_dir)
             .build_unix(&config.socket)
             .await?
             .handshake()
             .await?;
+        let handshake_seconds = handshake_started.elapsed().as_secs_f64();
         let mut trees = BTreeMap::new();
+        let mut tree_times = Vec::new();
         for source in std::iter::once(&config.source).chain(&config.package_sources) {
+            let tree_started = Instant::now();
             if source.starts_with(&config.target)
                 || trees
                     .keys()
@@ -572,16 +604,41 @@ impl Prepared {
             {
                 bail!("source roots must be disjoint and cannot be inside target");
             }
+            // Namespace package mounts can have scratch paths while retaining
+            // the exact directory identity of a registered immutable store root.
+            // Subdirectories and lookalike trees still take the validated NAR route.
+            let store_input = config
+                .package_store_inputs
+                .get(source)
+                .filter(|_| source != &config.source)
+                .and_then(|input| Self::bound_store_root(source, input).ok().flatten());
+            let mut method = "store-path";
+            let mut nar_bytes = 0;
             let input = if source.starts_with("/nix/store") {
                 Self::input_tree(&mut daemon, source).await?
+            } else if let Some(input) = store_input
+                && daemon.is_valid_path(&input).await?
+            {
+                method = "store-root";
+                input.to_absolute_path(&store_dir)
             } else {
+                method = "nar";
                 let source = WorkspaceSource::new(source, source, &config.target)?;
-                store::add_prepared_nar(&mut daemon, &source.nar()?)
+                let nar = source.nar()?;
+                nar_bytes = nar.len();
+                store::add_prepared_nar(&mut daemon, &nar)
                     .await?
                     .to_absolute_path(&store_dir)
             };
+            tree_times.push(serde_json::json!({
+                "logical": source,
+                "method": method,
+                "narBytes": nar_bytes,
+                "seconds": tree_started.elapsed().as_secs_f64(),
+            }));
             trees.insert(source.clone(), input);
         }
+        let builder_started = Instant::now();
         let builder_nar = store::source_nar(&std::env::current_exe()?)?;
         let builder_store = daemon
             .add_ca_to_store(
@@ -594,11 +651,13 @@ impl Prepared {
             .await?
             .path
             .to_absolute_path(&store_dir);
+        let builder_seconds = builder_started.elapsed().as_secs_f64();
         let prepared = Self {
             config,
             trees,
             builder_store,
         };
+        let guard_started = Instant::now();
         if prepared.config.gc_roots.is_some() {
             let references = prepared
                 .trees
@@ -619,6 +678,17 @@ impl Prepared {
                 .to_absolute_path(&store_dir);
             prepared.pin(&mut daemon, &guard).await?;
         }
+        Self::write_json(
+            evidence,
+            &serde_json::json!({
+                "seconds": started.elapsed().as_secs_f64(),
+                "handshakeSeconds": handshake_seconds,
+                "trees": tree_times,
+                "builderImportSeconds": builder_seconds,
+                "builderNarBytes": builder_nar.len(),
+                "guardSeconds": guard_started.elapsed().as_secs_f64(),
+            }),
+        )?;
         Ok(prepared)
     }
 
@@ -1132,6 +1202,22 @@ impl Prepared {
         references
     }
 
+    // Descriptive layout values remain compiler inputs without granting reads
+    // across source roots. Explicit forwarded path inputs still declare roots.
+    fn source_environment<'a>(
+        environment: &'a [(Vec<u8>, Vec<u8>)],
+        layout_names: &'a BTreeSet<String>,
+    ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
+        environment
+            .iter()
+            .filter(move |(name, _)| {
+                !layout_names
+                    .iter()
+                    .any(|layout| layout.as_bytes() == name.as_slice())
+            })
+            .map(|(name, value)| (name.as_slice(), value.as_slice()))
+    }
+
     // Select whole declared roots, never compiler dep-info files: proc macros
     // can read any file within a retained root. Dependency receipts add their
     // source owners after capturing this invocation's generated inputs.
@@ -1296,9 +1382,10 @@ impl Prepared {
             &self.trees,
             &cwd,
             args.iter().map(|value| value.as_bytes()),
-            environment
-                .iter()
-                .map(|(name, value)| (name.as_slice(), value.as_slice())),
+            // Layout values still reach rustc and determine its request. They
+            // describe the namespace without declaring access to every source
+            // root at that path; actual cross-root reads need explicit inputs.
+            Self::source_environment(&environment, &self.config.layout_environment_names),
         );
         Ok(Invocation {
             trees,
@@ -2002,6 +2089,45 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn bound_package_inputs_require_the_same_directory_and_a_whole_store_root() {
+        let store_dir = StoreDir::default();
+        let input = Prepared::store_path(Path::new(env!("BUILD_WRAP")))
+            .unwrap()
+            .to_absolute_path(&store_dir);
+        assert!(
+            Prepared::bound_store_root(&input, &input)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            Prepared::bound_store_root(&input, &input.join("bin"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(Prepared::bound_store_root(&input, &input.join("../other")).is_err());
+
+        let root = env::temp_dir().join(format!(
+            "dyndrv-store-binding-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        // A declared store path alone must not authenticate an unrelated mount.
+        assert!(Prepared::bound_store_root(&root, &input).unwrap().is_none());
+        let alias = root.join("alias");
+        unix_fs::symlink(&input, &alias).unwrap();
+        assert!(
+            Prepared::bound_store_root(&alias, &input)
+                .unwrap()
+                .is_some()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn source_scope_prunes_disjoint_local_and_packaged_roots() {
         let trees: BTreeMap<_, _> = [
             ("/build/workspace", "workspace-input"),
@@ -2045,6 +2171,53 @@ mod tests {
         assert_eq!(Prepared::source_trees(&trees, cwd, [], environment), trees);
         assert_eq!(
             Prepared::source_trees(&trees, cwd, [b"--data=/build".as_slice()], infrastructure),
+            trees,
+        );
+    }
+
+    #[test]
+    fn layout_environment_does_not_bind_the_workspace_to_registry_compilers() {
+        let mut trees = BTreeMap::from([
+            (
+                PathBuf::from("/build/workspace"),
+                PathBuf::from("workspace-v1"),
+            ),
+            (PathBuf::from("/build/vendor/pkg"), PathBuf::from("package")),
+        ]);
+        let cwd = Path::new("/build/vendor/pkg");
+        let mut environment = vec![(
+            b"INSTA_WORKSPACE_ROOT".to_vec(),
+            b"/build/workspace".to_vec(),
+        )];
+        let layouts = BTreeSet::from(["INSTA_WORKSPACE_ROOT".to_owned()]);
+        let selected = Prepared::source_trees(
+            &trees,
+            cwd,
+            [],
+            Prepared::source_environment(&environment, &layouts),
+        );
+        assert_eq!(selected.len(), 1);
+        trees.insert(
+            PathBuf::from("/build/workspace"),
+            PathBuf::from("workspace-v2"),
+        );
+        assert_eq!(
+            Prepared::source_trees(
+                &trees,
+                cwd,
+                [],
+                Prepared::source_environment(&environment, &layouts),
+            ),
+            selected,
+        );
+        environment.push((b"DATA_ROOT".to_vec(), b"/build/workspace".to_vec()));
+        assert_eq!(
+            Prepared::source_trees(
+                &trees,
+                cwd,
+                [],
+                Prepared::source_environment(&environment, &layouts),
+            ),
             trees,
         );
     }
@@ -2346,6 +2519,8 @@ mod tests {
                 gc_roots: None,
                 source: root.join("source"),
                 package_sources: Vec::new(),
+                package_store_inputs: BTreeMap::new(),
+                layout_environment_names: BTreeSet::new(),
                 target: target.clone(),
                 inputs: Vec::new(),
                 environment_names: BTreeSet::new(),
@@ -2608,6 +2783,8 @@ mod tests {
                 gc_roots: None,
                 source: root.join("source"),
                 package_sources: Vec::new(),
+                package_store_inputs: BTreeMap::new(),
+                layout_environment_names: BTreeSet::new(),
                 target: target.clone(),
                 inputs: Vec::new(),
                 environment_names: BTreeSet::new(),
