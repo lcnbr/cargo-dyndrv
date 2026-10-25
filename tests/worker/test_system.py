@@ -48,6 +48,7 @@ def command(arguments, *, expected=0):
 
 
 def qualify(bootstrap, second_user, evidence):
+    bootstrap = bootstrap.resolve()
     spec = json.loads((bootstrap / "environment.json").read_text())
     second = pwd.getpwnam(second_user)
     assert second.pw_uid not in {0, os.getuid(), 65534}, (
