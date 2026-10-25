@@ -6,7 +6,7 @@ use std::{
 };
 
 use color_eyre::eyre::{self, Context};
-use harmonia_store_content_address::ContentAddressMethodAlgorithm;
+use harmonia_store_content_address::{self, ContentAddress, ContentAddressMethodAlgorithm};
 use harmonia_store_derivation::{
     derivation::{Derivation, DerivationOutput},
     derived_path::{OutputName, SingleDerivedPath},
@@ -60,12 +60,26 @@ pub(crate) fn source_nar(real_path: &Path) -> eyre::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Import the exact source image already validated by a bound graph. No path
-/// reread or root-key cache is involved in this opt-in route.
+fn prepared_nar_path(source_nar: &[u8]) -> StorePath {
+    let name = StorePathName::from_str("bound-workspace-src")
+        .expect("the fixed prepared-source name is valid");
+    let address = ContentAddress::NixArchive(SHA256.digest(source_nar));
+    harmonia_store_content_address::make_store_path_from_ca(&StoreDir::default(), name, address)
+}
+
+/// Reuse or import the exact validated source image. All bytes are hashed on
+/// every call; only daemon transfer and import are skipped for a registered path.
 pub(crate) async fn add_prepared_nar<T: DaemonStore>(
     store: &mut T,
     source_nar: &[u8],
 ) -> eyre::Result<StorePath> {
+    let expected = prepared_nar_path(source_nar);
+    // Establish the temporary GC root before checking validity, then keep the
+    // daemon connection until the caller has retained the complete input graph.
+    store.add_temp_root(&expected).await?;
+    if store.is_valid_path(&expected).await? {
+        return Ok(expected);
+    }
     Ok(store
         .add_ca_to_store(
             "bound-workspace-src",
@@ -230,8 +244,24 @@ pub async fn target_env_drv<T: DaemonStore>(
 
 #[cfg(test)]
 mod source_tests {
+    use super::prepared_nar_path;
     use super::source_nar;
+    use harmonia_store_path::StoreDir;
+    use std::path::Path;
     use std::{fs, os::unix::fs::symlink, time::SystemTime};
+
+    #[test]
+    fn prepared_source_identity_matches_nix_and_hashes_all_bytes() {
+        // Reference from nix-store --print-fixed-path --recursive sha256 using
+        // the SHA-256 of this complete image and the prepared-source name.
+        let image = b"complete validated source image";
+        let path = prepared_nar_path(image);
+        assert_eq!(
+            path.to_absolute_path(&StoreDir::default()),
+            Path::new("/nix/store/l05pdmh56lsnki1yvmlj0ks48vma0mqr-bound-workspace-src")
+        );
+        assert_ne!(path, prepared_nar_path(b"complete validated source imagE"));
+    }
 
     #[test]
     fn vendor_root_symlink_imports_package_contents() {

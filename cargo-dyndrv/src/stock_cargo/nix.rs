@@ -132,6 +132,18 @@ struct Delivered {
     trees: BTreeMap<PathBuf, PathBuf>,
 }
 
+impl Delivered {
+    fn validate(&self, path: &Path) -> eyre::Result<()> {
+        if self.version != 5
+            || !self.owned.contains(path)
+            || !self.owned.iter().all(|path| self.files.contains_key(path))
+        {
+            bail!("artifact receipt version or ownership mismatch");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SnapshotReferences {
@@ -760,15 +772,7 @@ impl Prepared {
             bail!("artifact receipt must be a regular file");
         }
         let receipt: Delivered = serde_json::from_slice(&fs::read(file)?)?;
-        if receipt.version != 5
-            || !receipt.owned.contains(path)
-            || !receipt
-                .owned
-                .iter()
-                .all(|path| receipt.files.contains_key(path))
-        {
-            bail!("artifact receipt version or ownership mismatch");
-        }
+        receipt.validate(path)?;
         Ok(receipt)
     }
 
@@ -782,6 +786,11 @@ impl Prepared {
         let (mut references, incremental_children, _leases) =
             incremental::State::snapshot_references(self)?;
         let mut owners = BTreeMap::new();
+        // Overlapping transitive maps may repeat immutable paths. Cache only
+        // exact backing paths for this snapshot, with files and trees separate.
+        // Mutable targets and their complete byte comparisons are never cached.
+        let mut validated_files = BTreeSet::new();
+        let mut validated_trees = BTreeSet::new();
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let path = entry.path();
@@ -800,23 +809,30 @@ impl Prepared {
             let [key] = keys.as_slice() else {
                 bail!("artifact receipt filename does not identify one owned file");
             };
-            let receipt = self.delivered(key)?;
+            receipt.validate(key)?;
             for input in receipt.trees.values() {
-                if !self.physical(input)?.is_dir() {
-                    bail!("snapshot dependency source lacks immutable backing");
+                if !validated_trees.contains(input) {
+                    if !self.physical(input)?.is_dir() {
+                        bail!("snapshot dependency source lacks immutable backing");
+                    }
+                    references
+                        .insert(Self::store_path(input)?.to_absolute_path(&StoreDir::default()));
+                    validated_trees.insert(input.clone());
                 }
-                references.insert(Self::store_path(input)?.to_absolute_path(&StoreDir::default()));
             }
             Self::scratch(key)?;
             if !key.starts_with(&self.config.target) {
                 bail!("snapshot artifact escapes target");
             }
             match key.symlink_metadata() {
-                Ok(_) => {
+                Ok(info) => {
+                    if !info.is_file() {
+                        bail!("existing compiler output is not a regular file");
+                    }
                     if receipt.compiler_status.is_none() || key.canonicalize()? != **key {
                         bail!("snapshot artifact is incomplete or traverses symlinks");
                     }
-                    self.validate_replacement(key)?;
+                    self.validate_receipt_contents(key, &receipt)?;
                     owners.insert((*key).clone(), receipt.files[*key].clone());
                 }
                 // Build scripts may remove their positive/negative probe files.
@@ -830,12 +846,17 @@ impl Prepared {
             // the current mutable target. Each current key is checked above.
             for (target, input) in receipt.files {
                 Self::scratch(&target)?;
-                if !target.starts_with(&self.config.target)
-                    || !self.physical(&input)?.symlink_metadata()?.is_file()
-                {
+                if !target.starts_with(&self.config.target) {
                     bail!("snapshot dependency is outside target or lacks immutable backing");
                 }
-                references.insert(Self::store_path(&input)?.to_absolute_path(&StoreDir::default()));
+                if !validated_files.contains(&input) {
+                    if !self.physical(&input)?.symlink_metadata()?.is_file() {
+                        bail!("snapshot dependency is outside target or lacks immutable backing");
+                    }
+                    references
+                        .insert(Self::store_path(&input)?.to_absolute_path(&StoreDir::default()));
+                    validated_files.insert(input);
+                }
             }
         }
         Ok(SnapshotReferences {
@@ -873,12 +894,19 @@ impl Prepared {
                 let old = self
                     .delivered(target)
                     .wrap_err("existing compiler output is not owned by dyndrv")?;
-                if !same_contents(target, &self.physical(&old.files[target])?)? {
-                    bail!("existing compiler output differs from its immutable receipt");
-                }
+                self.validate_receipt_contents(target, &old)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    // Callers validate receipt ownership and target regularity before comparing.
+    // Reusing parsed metadata must still read the current mutable artifact bytes.
+    fn validate_receipt_contents(&self, target: &Path, receipt: &Delivered) -> eyre::Result<()> {
+        if !same_contents(target, &self.physical(&receipt.files[target])?)? {
+            bail!("existing compiler output differs from its immutable receipt");
         }
         Ok(())
     }
@@ -2672,7 +2700,19 @@ mod tests {
                 .unwrap(),
             subset(&["libleaf.rmeta", "libmiddle.rmeta"])
         );
-        fs::write(target.join("libleaf.rlib"), "tampered archive").unwrap();
+        let archive = target.join("libleaf.rlib");
+        let parsed = backend.delivered(&archive).unwrap();
+        backend
+            .validate_receipt_contents(&archive, &parsed)
+            .unwrap();
+        let mut bytes = fs::read(&archive).unwrap();
+        bytes[0] ^= 1;
+        fs::write(&archive, &bytes).unwrap();
+        assert!(
+            backend
+                .validate_receipt_contents(&archive, &parsed)
+                .is_err()
+        );
         assert!(
             backend
                 .dependencies(&args("bin", "libmiddle.rlib"), &mut BTreeMap::new())
@@ -2685,7 +2725,8 @@ mod tests {
             early
         );
         assert!(backend.snapshot_references().is_err());
-        fs::write(target.join("libleaf.rlib"), "libleaf.rlib").unwrap();
+        bytes[0] ^= 1;
+        fs::write(&archive, &bytes).unwrap();
         let snapshot = backend.snapshot_references().unwrap();
         assert_eq!(snapshot.owned_files, 5);
         assert_eq!(snapshot.incremental_children, 0);
@@ -2696,6 +2737,25 @@ mod tests {
                 old_source,
                 old_generated,
             ])
+        );
+        let mut invalid = backend.delivered(&archive).unwrap();
+        invalid.version = 4;
+        assert!(invalid.validate(&archive).is_err());
+        backend.publish_receipt(&archive, &invalid).unwrap();
+        assert!(backend.validate_replacement(&archive).is_err());
+        assert!(backend.snapshot_references().is_err());
+        invalid.version = 5;
+        // Keep this key mapped while removing another owned file's mapping.
+        invalid.files.remove(&target.join("leaf.d")).unwrap();
+        assert!(invalid.files.contains_key(&archive));
+        assert!(invalid.validate(&archive).is_err());
+        backend.publish_receipt(&archive, &invalid).unwrap();
+        assert!(backend.validate_replacement(&archive).is_err());
+        assert!(backend.snapshot_references().is_err());
+        receipt(
+            &["libleaf.rmeta", "libleaf.rlib", "leaf.d"],
+            Some(0),
+            subset(&["libleaf.rmeta", "libleaf.rlib", "leaf.d"]),
         );
         // Expected compile-fail tests retain dep-info from finished rustc
         // failures. Snapshot ownership is distinct from link readiness.
@@ -2729,6 +2789,25 @@ mod tests {
         backend.reject_incomplete().unwrap();
         assert!(backend.snapshot_references().is_err());
         fs::remove_file(target.join(".dyndrv-delivered/rejected")).unwrap();
+        // A transitive-only file must be checked even after a sibling in its
+        // store root has passed. It has neither a current target nor a receipt.
+        let transitive = target.join("zz-transitive.rlib");
+        let input = files[&archive].parent().unwrap().join("zz-transitive.rlib");
+        let physical = backend.physical(&input).unwrap();
+        fs::write(&physical, b"transitive-only").unwrap();
+        let mut retained = backend.delivered(&archive).unwrap();
+        retained.files.insert(transitive, input);
+        backend.publish_receipt(&archive, &retained).unwrap();
+        let complete = backend.snapshot_references().unwrap();
+        assert_eq!(complete.owned_files, snapshot.owned_files);
+        assert_eq!(complete.store_paths, snapshot.store_paths);
+        fs::remove_file(&physical).unwrap();
+        assert!(backend.snapshot_references().is_err());
+        receipt(
+            &["libleaf.rmeta", "libleaf.rlib", "leaf.d"],
+            Some(0),
+            subset(&["libleaf.rmeta", "libleaf.rlib", "leaf.d"]),
+        );
         fs::remove_file(
             backend
                 .physical(&files[&target.join("libleaf.rlib")])

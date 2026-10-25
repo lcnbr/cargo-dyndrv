@@ -42,6 +42,14 @@ The environment specification contains:
   `config.toml`. Its lockfile is supplied as `CARGO_DYNDRV_CARGO_LOCK`; the worker
   strips declared private values before invoking Nix. The vendor provider can use
   Crane or another application-selected implementation.
+- `vendor_lockfile_only`: optional, defaults to false. Enable only when the vendor
+  provider is a function of lockfile bytes and its immutable expression inputs;
+  it must not depend on other caller environment values, mutable files or mutable
+  network data. Expression imports and the resolved Nix executable must be
+  immutable, such as Nix store paths. The worker can then cache evaluation results by lockfile content,
+  expression and Nix executable identity. Cached outputs are checked in the host
+  store before reuse, and missing or invalid outputs are evaluated again. The
+  cache adds no permanent GC roots; active commands retain their inputs normally.
 - `runtime_environment_names` and `runtime_environment_prefixes`: application
   values forwarded to runtime processes but omitted from compiler requests,
   except for the stable layout variables described below.
@@ -118,6 +126,14 @@ syntax, mounted directory identity and daemon validity before reusing that
 immutable input. Subdirectories, including packages within Git checkouts, retain
 the existing content snapshot/import path. Namespace mounts remain read-only;
 mutable trees are never cached by modification time.
+Prepared NAR images are hashed in full on every invocation. If the corresponding
+content-addressed source path is already registered, the driver reuses it instead
+of transferring and importing the same image again. Source identities and byte
+validation remain unchanged.
+Artifact snapshots reuse each parsed receipt and deduplicate exact immutable
+backing-path checks within that snapshot. Every mutable owned artifact still
+receives a full byte comparison, and incremental backing validation is unchanged.
+No receipt or artifact-validity cache persists across commands.
 
 Staged commands record `last-run.json` once their workspace target passes the
 interrupted-command check. Failures before this point, including initial metadata

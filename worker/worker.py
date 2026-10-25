@@ -17,6 +17,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import uuid
@@ -571,11 +572,68 @@ class Worker:
         }
 
     def vendor_input(self, lock):
+        """Cache only providers determined by lock bytes and immutable inputs.
+
+        The opt-in excludes dependence on the lock pathname, caller environment
+        and mutable imports. Host store queries use the same client as builds.
+        """
+        if self.spec.get("vendor_lockfile_only") is not True:
+            return self.build_vendor_input(lock)
+        nix = str(Path(self.spec["nix"]).resolve())
+        contents = lock.read_bytes()
+        key = hashlib.sha256(
+            json.dumps(
+                {
+                    "version": 1,
+                    "lock": hashlib.sha256(contents).hexdigest(),
+                    "expression": self.spec["vendor_expression"],
+                    "nix": [self.spec["nix"], nix],
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        directory = self.state / "vendor-inputs"
+        private_directory(directory)
+        cache = directory / (key + ".json")
+        store_path = r"/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-[A-Za-z0-9+._?=-]+"
+        with locked(directory / (key + ".lock")):
+            try:
+                entry = json.loads(cache.read_text())
+            except (OSError, ValueError):
+                entry = None
+            if (
+                isinstance(entry, dict)
+                and entry.get("version") == 1
+                and entry.get("key") == key
+                and isinstance(entry.get("path"), str)
+                and re.fullmatch(store_path, entry["path"])
+                and subprocess.run(
+                    [nix, "path-info", entry["path"]],
+                    env=self.client,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).returncode
+                == 0
+            ):
+                return Path(entry["path"])
+            # A concurrent lockfile edit must not populate the old content key.
+            with tempfile.TemporaryDirectory(
+                dir=directory, prefix=key + "."
+            ) as temporary:
+                snapshot = Path(temporary) / "Cargo.lock"
+                snapshot.write_bytes(contents)
+                vendor = self.build_vendor_input(snapshot, nix=nix)
+            if re.fullmatch(store_path, str(vendor)):
+                write_json(cache, {"version": 1, "key": key, "path": str(vendor)})
+            return vendor
+
+    def build_vendor_input(self, lock, *, nix=None):
         environment = self.client | {"CARGO_DYNDRV_CARGO_LOCK": str(lock)}
         return Path(
             subprocess.check_output(
                 [
-                    self.spec["nix"],
+                    nix or self.spec["nix"],
                     "build",
                     "--impure",
                     "--no-link",

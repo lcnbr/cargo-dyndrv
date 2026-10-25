@@ -191,6 +191,194 @@ class WorkerPolicyTests(unittest.TestCase):
         self.assertEqual(failure.exception.returncode, 17)
 
 
+class VendorInputTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="dyndrv-vendor-input-")
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.lock = self.directory / "Cargo.lock"
+        self.lock.write_text("version = 3\n")
+        self.runner = worker.Worker.__new__(worker.Worker)
+        self.runner.state = self.directory / "state"
+        self.runner.state.mkdir(mode=0o700)
+        self.runner.spec = {
+            "vendor_lockfile_only": True,
+            "vendor_expression": "immutable lockfile-only provider",
+            "nix": "/nix/store/" + "0" * 32 + "-nix/bin/nix",
+        }
+        self.runner.client = {"NIX_REMOTE": "daemon", "HOST_VALUE": "not-persisted"}
+        self.vendor = "/nix/store/" + "1" * 32 + "-vendor"
+        self.build = self.enterContext(
+            mock.patch.object(
+                worker.subprocess, "check_output", return_value=self.vendor + "\n"
+            )
+        )
+        self.validity = self.enterContext(
+            mock.patch.object(
+                worker.subprocess, "run", return_value=mock.Mock(returncode=0)
+            )
+        )
+
+    def test_cache_hit_uses_host_store_and_persists_only_result_identity(self):
+        self.assertEqual(self.runner.vendor_input(self.lock), Path(self.vendor))
+        self.assertEqual(self.runner.vendor_input(self.lock), Path(self.vendor))
+        self.build.assert_called_once()
+        self.validity.assert_called_once_with(
+            [self.runner.spec["nix"], "path-info", self.vendor],
+            env=self.runner.client,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        cache = next((self.runner.state / "vendor-inputs").glob("*.json"))
+        self.assertEqual(
+            json.loads(cache.read_text()),
+            {"version": 1, "key": cache.stem, "path": self.vendor},
+        )
+        self.assertNotIn("not-persisted", cache.read_text())
+        self.assertFalse((self.runner.state / "roots").exists())
+
+    def test_content_expression_and_tool_change_keys_but_lock_path_does_not(self):
+        self.runner.vendor_input(self.lock)
+        relocated = self.directory / "relocated.lock"
+        relocated.write_bytes(self.lock.read_bytes())
+        self.runner.vendor_input(relocated)
+        self.assertEqual(self.build.call_count, 1)
+        stamp = self.lock.stat()
+        self.lock.write_text("version = 4\n")
+        os.utime(self.lock, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        self.runner.vendor_input(self.lock)
+        self.runner.spec["vendor_expression"] += " changed"
+        self.runner.vendor_input(self.lock)
+        self.runner.spec["nix"] += "-changed"
+        self.runner.vendor_input(self.lock)
+        self.assertEqual(self.build.call_count, 4)
+        self.assertEqual(
+            len(list((self.runner.state / "vendor-inputs").glob("*.json"))), 4
+        )
+
+    def test_profile_changes_after_keying_do_not_change_the_executed_binary(self):
+        first, second = (self.directory / name for name in ("nix-a", "nix-b"))
+        first.touch()
+        second.touch()
+        profile = self.directory / "profile-nix"
+        profile.symlink_to(first)
+        self.runner.spec["nix"] = str(profile)
+        original_locked = worker.locked
+
+        def changed_profile(path):
+            profile.unlink()
+            profile.symlink_to(second)
+            return original_locked(path)
+
+        with mock.patch.object(worker, "locked", side_effect=changed_profile):
+            self.runner.vendor_input(self.lock)
+        self.assertEqual(self.build.call_args.args[0][0], str(first))
+        profile.unlink()
+        profile.symlink_to(first)
+        self.runner.vendor_input(self.lock)
+        self.assertEqual(self.validity.call_args.args[0][0], str(first))
+        self.build.assert_called_once()
+
+    def test_malformed_entries_rebuild_without_querying_untrusted_paths(self):
+        self.runner.vendor_input(self.lock)
+        cache = next((self.runner.state / "vendor-inputs").glob("*.json"))
+        entry = json.loads(cache.read_text())
+        invalid = [
+            b"not JSON",
+            b"\xff",
+            b"null",
+            b"[]",
+            *(
+                json.dumps(entry | change).encode()
+                for change in (
+                    {"version": 0},
+                    {"key": "wrong"},
+                    {"path": None},
+                    {"path": "/tmp/vendor"},
+                    {"path": self.vendor + "/subdirectory"},
+                    {"path": "/nix/store/" + "e" * 32 + "-vendor"},
+                )
+            ),
+        ]
+        for contents in invalid:
+            with self.subTest(contents=contents):
+                cache.write_bytes(contents)
+                self.build.reset_mock()
+                self.validity.reset_mock()
+                self.assertEqual(self.runner.vendor_input(self.lock), Path(self.vendor))
+                self.build.assert_called_once()
+                self.validity.assert_not_called()
+
+    def test_collected_store_path_rebuilds(self):
+        self.runner.vendor_input(self.lock)
+        self.build.reset_mock()
+        self.validity.return_value.returncode = 1
+        self.assertEqual(self.runner.vendor_input(self.lock), Path(self.vendor))
+        self.build.assert_called_once()
+        self.validity.assert_called_once()
+
+    def test_opt_out_preserves_impure_builds_without_reading_the_lock(self):
+        self.lock.unlink()
+        for enabled in (False, None):
+            with self.subTest(enabled=enabled):
+                self.runner.spec.pop("vendor_lockfile_only", None)
+                if enabled is not None:
+                    self.runner.spec["vendor_lockfile_only"] = enabled
+                self.build.reset_mock()
+                self.runner.vendor_input(self.lock)
+                self.runner.vendor_input(self.lock)
+                self.assertEqual(self.build.call_count, 2)
+        self.validity.assert_not_called()
+        self.assertFalse((self.runner.state / "vendor-inputs").exists())
+
+    def test_cache_build_uses_lock_snapshot_and_cleans_up_after_failure(self):
+        original = self.lock.read_bytes()
+        snapshots = []
+
+        def build(*arguments, **kwargs):
+            snapshot = Path(kwargs["env"]["CARGO_DYNDRV_CARGO_LOCK"])
+            snapshots.append(snapshot)
+            self.lock.write_text("version = 4\n")
+            self.assertEqual(snapshot.name, "Cargo.lock")
+            self.assertEqual(snapshot.read_bytes(), original)
+            return self.vendor + "\n"
+
+        self.build.side_effect = build
+        self.runner.vendor_input(self.lock)
+        self.assertFalse(snapshots[0].parent.exists())
+        self.build.side_effect = subprocess.CalledProcessError(7, "nix")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.runner.vendor_input(self.lock)
+        directory = self.runner.state / "vendor-inputs"
+        self.assertFalse(any(path.is_dir() for path in directory.iterdir()))
+        self.assertEqual(len(list(directory.glob("*.json"))), 1)
+        self.lock.write_bytes(original)
+        self.assertEqual(self.runner.vendor_input(self.lock), Path(self.vendor))
+        self.assertEqual(self.build.call_count, 2)
+
+    def test_cross_workspace_clients_serialize_one_cache_key(self):
+        other = worker.Worker.__new__(worker.Worker)
+        other.__dict__.update(self.runner.__dict__)
+        self.runner.workspace = self.directory / "first-workspace"
+        other.workspace = self.directory / "second-workspace"
+
+        def build(*arguments, **kwargs):
+            time.sleep(0.02)
+            return self.vendor + "\n"
+
+        self.build.side_effect = build
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(
+                pool.map(
+                    lambda runner: runner.vendor_input(self.lock), (self.runner, other)
+                )
+            )
+        self.assertEqual(results, [Path(self.vendor), Path(self.vendor)])
+        self.build.assert_called_once()
+        self.validity.assert_called_once()
+
+
 class VendorLayoutTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="dyndrv-vendor-")
