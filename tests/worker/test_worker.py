@@ -24,6 +24,19 @@ import worker
 
 
 class WorkerPolicyTests(unittest.TestCase):
+    def test_source_roots_preserve_lexical_ancestry_and_raw_strings(self):
+        for packages, expected in (
+            (
+                ["/a/b/child", "/a/b", "/a/bc", "/a/bc/deep", "/a/beta", "/a/b"],
+                {"/a/b", "/a/bc", "/a/beta"},
+            ),
+            (["/raw/./root/", "/other"], {"/raw/./root/", "/other"}),
+            (["/a/b/../child", "/a/b"], {"/a/b"}),
+            (["/equal", "/equal/", "/separate"], {"/separate"}),
+        ):
+            with self.subTest(packages=packages):
+                self.assertEqual(worker.Worker.source_roots(packages), expected)
+
     def test_application_policy_forwards_runtime_values_but_excludes_private_build_inputs(
         self,
     ):

@@ -128,8 +128,9 @@ zero if that interval was never entered. `total_seconds` measures the worker run
 including metadata discovery, staging, lock waits and report export. Both use a
 monotonic clock. `phase_seconds` contains elapsed seconds for the phases reached:
 `original_metadata`, `vendor_input`, `source_layout` (`SourceLayout.prepare`),
-`vendor_layout`, `provision`, `in_namespace_metadata`, `driver`, `post_commands`,
-`snapshot_references`, `retain` and `install_binaries`. Failed phases include time
+`vendor_layout`, `provision`, `in_namespace_metadata`, `package_sources` (package-root
+collection and pruning), `driver`, `post_commands`, `snapshot_references`, `retain`
+and `install_binaries`. Failed phases include time
 until failure; repeated retention attempts accumulate. Reports also retain partial
 preparation timings on failure once the state directory is known. These phases
 cover their named operations; their sum does not include every setup or export

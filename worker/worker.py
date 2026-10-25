@@ -20,6 +20,7 @@ import sys
 import time
 import tomllib
 import uuid
+from collections import Counter
 from pathlib import Path
 
 import tomli_w
@@ -511,6 +512,17 @@ class Worker:
         return name in self.workspace_names or (
             name not in runtime_names and not name.startswith(self.runtime_prefixes)
         )
+
+    @staticmethod
+    def source_roots(packages):
+        paths = {raw: Path(raw) for raw in packages}
+        # Distinct raw spellings of the same lexical path cover each other, too.
+        roots = Counter(paths.values())
+        return {
+            raw
+            for raw, path in paths.items()
+            if roots[path] == 1 and not any(parent in roots for parent in path.parents)
+        }
 
     def vendor_layout(self, vendor, stage):
         """Expose each complete vendored package at a lock-independent path.
@@ -1085,20 +1097,14 @@ class Worker:
                             capture=True,
                         )
                     )
-                packages = set(layout["package_sources"])
-                for package in prepared["packages"]:
-                    if package["source"] is not None:
-                        packages.add(
-                            str(Path(package["manifest_path"]).parent.resolve())
-                        )
-                packages = {
-                    path
-                    for path in packages
-                    if not any(
-                        path != other and Path(path).is_relative_to(other)
-                        for other in packages
-                    )
-                }
+                with timings.phase("package_sources"):
+                    packages = set(layout["package_sources"])
+                    for package in prepared["packages"]:
+                        if package["source"] is not None:
+                            packages.add(
+                                str(Path(package["manifest_path"]).parent.resolve())
+                            )
+                    packages = self.source_roots(packages)
                 omitted = sorted(
                     name
                     for name in self.environment.keys() | runtime_names
