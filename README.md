@@ -24,8 +24,10 @@ For the GammaLoop experiment, use the implemented `capture-cargo`, `nix-cargo`
 and `snapshot-references` commands with an unmodified Cargo executable. The
 [stock-Cargo backend guide](docs/stock-cargo.typ) describes command usage, the
 private Nix worker, jobserver transport and compiler-state ownership. This route
-uses stock Nix with content-addressed derivations; its worker lifecycle and cache
-delivery must be supplied explicitly.
+uses stock Nix with content-addressed derivations. The packaged
+[`cargo-dyndrv-worker`](docs/worker.typ) now supplies editable source staging,
+worker/store lifecycle and cache retention; applications supply their compiler
+environment, runtime policy and ordinary command arguments.
 
 The following sections describe the original unit-graph executor and earlier
 research graph variants, with their separate requirements and limitations.

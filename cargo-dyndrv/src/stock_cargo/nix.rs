@@ -22,14 +22,16 @@ use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore};
 use harmonia_utils_hash::{Algorithm::SHA256, HashFormat};
 use serde::{Deserialize, Serialize};
 use source_wrap::same_contents;
+use std::borrow::Cow;
+use std::os::unix::fs as unix_fs;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{OpenOptionsExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         process::ExitStatusExt,
     },
     path::{Component, Path, PathBuf},
@@ -37,6 +39,14 @@ use std::{
     str::FromStr,
     time::Instant,
 };
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum StoreMode {
+    #[default]
+    Private,
+    System,
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +56,10 @@ struct Config {
     // The physical store mount is transport only; logical /nix/store paths are
     // the immutable inputs. Private local-store tests use their own store root.
     real_store: PathBuf,
+    #[serde(default)]
+    store_mode: StoreMode,
+    #[serde(default)]
+    gc_roots: Option<PathBuf>,
     source: PathBuf,
     #[serde(default)]
     package_sources: Vec<PathBuf>,
@@ -67,6 +81,8 @@ struct Config {
     jobserver_socket_directory: Option<PathBuf>,
     inputs: Vec<PathBuf>,
     environment_names: BTreeSet<String>,
+    #[serde(default)]
+    environment_prefixes: Vec<String>,
     omitted_environment_names: BTreeSet<String>,
 }
 
@@ -108,6 +124,8 @@ struct Delivered {
     compiler_status: Option<i32>,
     owned: BTreeSet<PathBuf>,
     files: BTreeMap<PathBuf, PathBuf>,
+    // Complete source images needed when a downstream compiler expands macros.
+    trees: BTreeMap<PathBuf, PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -313,6 +331,63 @@ impl Invocation {
 }
 
 impl Prepared {
+    fn configured_socket(config: &Config) -> eyre::Result<PathBuf> {
+        match config.store_mode {
+            StoreMode::Private => bound_graph::socket(&config.socket),
+            StoreMode::System => {
+                let path = config.socket.canonicalize()?;
+                let info = config.socket.symlink_metadata()?;
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| eyre::eyre!("daemon socket has no parent"))?
+                    .metadata()?;
+                let Some(roots) = &config.gc_roots else {
+                    bail!("system mode requires durable GC roots");
+                };
+                let directory = jobserver::Broker::directory(roots)?;
+                let uid = directory.metadata()?.uid();
+                if path != Path::new("/nix/var/nix/daemon-socket/socket")
+                    || config.real_store != Path::new("/")
+                    || !info.file_type().is_socket()
+                    || parent.uid() != info.uid()
+                    || parent.uid() == uid
+                    || parent.mode() & 0o022 != 0
+                {
+                    bail!(
+                        "system mode requires the administrator-owned system daemon and durable GC roots"
+                    );
+                }
+                Ok(path)
+            }
+        }
+    }
+
+    async fn pin<T: DaemonStore>(&self, daemon: &mut T, input: &Path) -> eyre::Result<()> {
+        let Some(directory) = &self.config.gc_roots else {
+            return Ok(());
+        };
+        let _directory = jobserver::Broker::directory(directory)?;
+        let store_path = Self::store_path(input)?;
+        daemon.add_temp_root(&store_path).await?;
+        let owner = store_path.to_absolute_path(&StoreDir::default());
+        let root = directory.join(
+            owner
+                .file_name()
+                .expect("validated store paths have a basename"),
+        );
+        match unix_fs::symlink(&owner, &root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                if fs::read_link(&root)? != owner {
+                    bail!("GC root already names a different immutable owner");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        daemon.add_indirect_root(&root.into_bytes()).await?;
+        Ok(())
+    }
+
     // Stock Cargo nests its workspace wrapper inside RUSTC_WRAPPER. Keep the
     // entire driver command intact; inspect the inner arguments only for queries.
     fn compiler<'a>(
@@ -341,6 +416,15 @@ impl Prepared {
             || args == [OsStr::new("-V")]
             || args == [OsStr::new("--version")]
             || args == [OsStr::new("--version"), OsStr::new("--verbose")]
+        {
+            return true;
+        }
+        // Maturin queries the target cfg before invoking Cargo. Match only this
+        // read-only argument shape; compiler actions still require delivery.
+        if let [print, cfg, target, _triple] = args
+            && print == "--print"
+            && cfg == "cfg"
+            && target == "--target"
         {
             return true;
         }
@@ -424,7 +508,7 @@ impl Prepared {
         if config.private_target && !config.source_overlay {
             bail!("private target storage requires source overlays");
         }
-        bound_graph::socket(&config.socket)?;
+        Self::configured_socket(&config)?;
         let store_dir = StoreDir::default();
         Tool::bound(&store_dir, &config.nix)?;
         Self::scratch(&config.source)?;
@@ -510,11 +594,32 @@ impl Prepared {
             .await?
             .path
             .to_absolute_path(&store_dir);
-        Ok(Self {
+        let prepared = Self {
             config,
             trees,
             builder_store,
-        })
+        };
+        if prepared.config.gc_roots.is_some() {
+            let references = prepared
+                .trees
+                .values()
+                .chain([&prepared.builder_store])
+                .map(|path| Self::store_path(path))
+                .collect::<eyre::Result<BTreeSet<_>>>()?;
+            let guard = daemon
+                .add_ca_to_store(
+                    "stock-cargo-session-inputs",
+                    ContentAddressMethodAlgorithm::Text,
+                    &references,
+                    false,
+                    &b"compiler session inputs"[..],
+                )
+                .await?
+                .path
+                .to_absolute_path(&store_dir);
+            prepared.pin(&mut daemon, &guard).await?;
+        }
+        Ok(prepared)
     }
 
     pub(super) fn reject_incomplete(&self) -> eyre::Result<()> {
@@ -585,7 +690,7 @@ impl Prepared {
             bail!("artifact receipt must be a regular file");
         }
         let receipt: Delivered = serde_json::from_slice(&fs::read(file)?)?;
-        if receipt.version != 4
+        if receipt.version != 5
             || !receipt.owned.contains(path)
             || !receipt
                 .owned
@@ -626,6 +731,12 @@ impl Prepared {
                 bail!("artifact receipt filename does not identify one owned file");
             };
             let receipt = self.delivered(key)?;
+            for input in receipt.trees.values() {
+                if !self.physical(input)?.is_dir() {
+                    bail!("snapshot dependency source lacks immutable backing");
+                }
+                references.insert(Self::store_path(input)?.to_absolute_path(&StoreDir::default()));
+            }
             Self::scratch(key)?;
             if !key.starts_with(&self.config.target) {
                 bail!("snapshot artifact escapes target");
@@ -743,10 +854,11 @@ impl Prepared {
             self.publish_receipt(
                 target,
                 &Delivered {
-                    version: 4,
+                    version: 5,
                     compiler_status: None,
                     owned: BTreeSet::from([target.clone()]),
                     files,
+                    trees: invocation.trees.clone(),
                 },
             )?;
             Ok(owner)
@@ -758,8 +870,37 @@ impl Prepared {
         result
     }
 
-    fn dependencies(&self, args: &[OsString]) -> eyre::Result<BTreeMap<PathBuf, PathBuf>> {
+    fn dependencies(
+        &self,
+        args: &[OsString],
+        trees: &mut BTreeMap<PathBuf, PathBuf>,
+    ) -> eyre::Result<BTreeMap<PathBuf, PathBuf>> {
         let mut dependencies = BTreeMap::new();
+        let mut source_trees = BTreeMap::new();
+        let mut retain_sources = |sources: BTreeMap<PathBuf, PathBuf>| -> eyre::Result<()> {
+            for (root, input) in sources {
+                // A Cargo-fresh macro can still read newly edited data. Prefer
+                // this session's declared trees and freshly captured inputs to
+                // its producer's snapshot. Other generated sources keep their
+                // immutable owner, which the target's GC roots retain.
+                let (root, input) = self
+                    .trees
+                    .iter()
+                    .chain(trees.iter())
+                    .find(|(current, _)| {
+                        root.starts_with(current)
+                            && (!root.starts_with(&self.config.target)
+                                || current.starts_with(&self.config.target))
+                    })
+                    .unwrap_or((&root, &input));
+                if let Some(previous) = source_trees.insert(root.clone(), input.clone())
+                    && previous != *input
+                {
+                    bail!("conflicting dependency source owners");
+                }
+            }
+            Ok(())
+        };
         let mut metadata = BTreeSet::new();
         let mut expanded = BTreeSet::new();
         let linking = Self::links_dependencies(args);
@@ -786,6 +927,7 @@ impl Prepared {
                 if linking && receipt.compiler_status != Some(0) {
                     bail!("link dependency is not completely delivered");
                 }
+                retain_sources(receipt.trees)?;
                 let files = if !linking && path.extension() == Some(OsStr::new("rmeta")) {
                     Self::metadata_files(receipt.files)
                 } else {
@@ -804,6 +946,7 @@ impl Prepared {
                 if receipt.compiler_status != Some(0) {
                     bail!("transitive link dependency is not completely delivered");
                 }
+                retain_sources(receipt.trees)?;
                 Self::merge_dependencies(&mut dependencies, receipt.files, &mut metadata)?;
             }
         }
@@ -815,6 +958,36 @@ impl Prepared {
             {
                 bail!("delivered dependency differs from immutable input");
             }
+        }
+        trees.extend(source_trees);
+        // Generated roots can overlap across producers. Materialization creates
+        // directories exclusively, so drop a child only when the ancestor's
+        // immutable image contains exactly that subtree. A workspace's empty
+        // target placeholder never covers generated sources beneath it.
+        let mut redundant = Vec::new();
+        for (root, input) in trees.iter() {
+            let ancestor = root.ancestors().skip(1).find_map(|parent| {
+                trees
+                    .get(parent)
+                    .filter(|_| {
+                        !root.starts_with(&self.config.target)
+                            || parent.starts_with(&self.config.target)
+                    })
+                    .map(|input| (parent, input))
+            });
+            if let Some((parent, owner)) = ancestor {
+                let subtree = owner.join(root.strip_prefix(parent)?);
+                if subtree != *input
+                    && store::source_nar(&self.physical(&subtree)?)?
+                        != store::source_nar(&self.physical(input)?)?
+                {
+                    bail!("overlapping dependency source images disagree");
+                }
+                redundant.push(root.clone());
+            }
+        }
+        for root in redundant {
+            trees.remove(&root);
         }
         Ok(dependencies)
     }
@@ -913,7 +1086,7 @@ impl Prepared {
             .map(|path| Self::store_path(path))
             .collect::<eyre::Result<BTreeSet<_>>>()?;
         references.extend(Self::metadata_references(&bytes, candidates));
-        Ok(daemon
+        let owner = daemon
             .add_ca_to_store(
                 "stock-cargo-metadata",
                 ContentAddressMethodAlgorithm::NixArchive(SHA256),
@@ -923,7 +1096,9 @@ impl Prepared {
             )
             .await?
             .path
-            .to_absolute_path(&StoreDir::default()))
+            .to_absolute_path(&StoreDir::default());
+        self.pin(daemon, &owner).await?;
+        Ok(owner)
     }
 
     fn metadata_references(bytes: &[u8], candidates: BTreeSet<StorePath>) -> BTreeSet<StorePath> {
@@ -957,6 +1132,121 @@ impl Prepared {
         references
     }
 
+    // Select whole declared roots, never compiler dep-info files: proc macros
+    // can read any file within a retained root. Dependency receipts add their
+    // source owners after capturing this invocation's generated inputs.
+    // The prepared map stays complete for workspace-mirror capture in execute.
+    fn source_trees<'a>(
+        trees: &BTreeMap<PathBuf, PathBuf>,
+        cwd: &Path,
+        arguments: impl IntoIterator<Item = &'a [u8]>,
+        environment: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    ) -> BTreeMap<PathBuf, PathBuf> {
+        let mut retained: BTreeSet<_> = trees.keys().filter(|root| cwd.starts_with(root)).collect();
+        if retained.is_empty() {
+            // Mirrors and generated Cargo projects are validated/captured later.
+            // Without a declared owner, relative paths have no known root scope.
+            return trees.clone();
+        }
+        // Nix's reserved builder directory is infrastructure, not a declaration
+        // of all sources beneath /build. Keep its value in the actual compiler
+        // environment and request identity; only source selection ignores it.
+        let values = arguments.into_iter().chain(
+            environment
+                .into_iter()
+                .filter_map(|(name, value)| (name != b"NIX_BUILD_TOP").then_some(value)),
+        );
+        for value in values {
+            if value
+                .split(|byte| *byte == b'/' || Self::source_path_boundary(*byte))
+                .any(|part| part == b"." || part == b"..")
+            {
+                // Lexically resolving traversal can change symlink semantics.
+                // Keep the layout intact when a value might escape its owner.
+                return trees.clone();
+            }
+            // Repeated slashes are equivalent path spelling, including in values
+            // containing flags or path lists. Leave all other bytes untouched.
+            let value = if value.windows(2).any(|part| part == b"//") {
+                let mut normalized = Vec::with_capacity(value.len());
+                for byte in value {
+                    if *byte != b'/' || normalized.last() != Some(&b'/') {
+                        normalized.push(*byte);
+                    }
+                }
+                Cow::Owned(normalized)
+            } else {
+                Cow::Borrowed(value)
+            };
+            retained.extend(
+                trees
+                    .keys()
+                    .filter(|root| Self::source_reference(&value, root)),
+            );
+        }
+        // Preparation rejects overlapping declared roots. Preserve that rule,
+        // but also make selection safe for nested maps: a parent image and all
+        // of its separately supplied descendants must remain together.
+        loop {
+            let previous = retained.len();
+            for root in trees.keys() {
+                if retained
+                    .iter()
+                    .any(|other| root.starts_with(other) || other.starts_with(root))
+                {
+                    retained.insert(root);
+                }
+            }
+            if retained.len() == previous {
+                break;
+            }
+        }
+        trees
+            .iter()
+            .filter(|(root, _)| retained.contains(root))
+            .map(|(root, input)| (root.to_path_buf(), input.to_path_buf()))
+            .collect()
+    }
+
+    fn source_path_boundary(byte: u8) -> bool {
+        byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'=' | b':'
+                    | b';'
+                    | b','
+                    | b'\''
+                    | b'"'
+                    | b'['
+                    | b']'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b'@'
+                    | 0
+                    | 0x1f
+            )
+    }
+
+    fn source_reference(value: &[u8], root: &Path) -> bool {
+        root.ancestors().any(|ancestor| {
+            let path = ancestor.as_os_str().as_bytes();
+            value.windows(path.len()).enumerate().any(|(offset, part)| {
+                part == path
+                    // A slash within another path is not a reference to `/`.
+                    && (path != b"/" || offset == 0 || Self::source_path_boundary(value[offset - 1]))
+                    && value.get(offset + path.len()).is_none_or(|next| {
+                        (*next == b'/'
+                            && (ancestor == root
+                                || value.get(offset + path.len() + 1)
+                                    .is_none_or(|byte| Self::source_path_boundary(*byte))))
+                            || Self::source_path_boundary(*next)
+                    })
+            })
+        })
+    }
+
     fn invocation(
         &self,
         program: &OsStr,
@@ -981,21 +1271,37 @@ impl Prepared {
         if let Some(state) = &mut incremental {
             state.observe = self.config.incremental_observer;
         }
-        let dependencies = self.dependencies(args)?;
         let mut environment = Vec::new();
         for (name, value) in std::env::vars_os() {
             let public_name = name
                 .to_str()
                 .ok_or_else(|| eyre::eyre!("environment name is not declared UTF-8"))?;
-            if self.config.environment_names.contains(public_name) {
+            if self.config.omitted_environment_names.contains(public_name) {
+                continue;
+            }
+            if self.config.environment_names.contains(public_name)
+                || self
+                    .config
+                    .environment_prefixes
+                    .iter()
+                    .any(|prefix| public_name.starts_with(prefix))
+            {
                 environment.push((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
             } else if !self.config.omitted_environment_names.contains(public_name) {
                 bail!("compiler environment name requires an explicit policy: {public_name}")
             }
         }
         environment.sort();
+        let trees = Self::source_trees(
+            &self.trees,
+            &cwd,
+            args.iter().map(|value| value.as_bytes()),
+            environment
+                .iter()
+                .map(|(name, value)| (name.as_slice(), value.as_slice())),
+        );
         Ok(Invocation {
-            trees: self.trees.clone(),
+            trees,
             source: self.config.source.clone(),
             target: self.config.target.clone(),
             cwd,
@@ -1018,7 +1324,7 @@ impl Prepared {
                 None
             },
             environment,
-            dependencies,
+            dependencies: BTreeMap::new(),
         })
     }
 
@@ -1031,7 +1337,7 @@ impl Prepared {
         role: &str,
     ) -> eyre::Result<ExitStatus> {
         let started = Instant::now();
-        bound_graph::socket(&self.config.socket)?;
+        Self::configured_socket(&self.config)?;
         let mut invocation = self.invocation(program, args, role)?;
         let _incremental_lock = invocation
             .incremental
@@ -1064,6 +1370,7 @@ impl Prepared {
             let input = store::add_prepared_nar(&mut daemon, &alias.nar()?)
                 .await?
                 .to_absolute_path(&store_dir);
+            self.pin(&mut daemon, &input).await?;
             invocation.trees.insert(invocation.cwd.clone(), input);
         }
         let mut directories = Self::input_directories(args)?;
@@ -1101,11 +1408,13 @@ impl Prepared {
                     "library/generated input must belong to Cargo target, a declared source or Nix store"
                 );
             }
-            invocation.trees.insert(
-                directory.clone(),
-                Self::input_tree(&mut daemon, &directory).await?,
-            );
+            let input = Self::input_tree(&mut daemon, &directory).await?;
+            self.pin(&mut daemon, &input).await?;
+            invocation.trees.insert(directory, input);
         }
+        // Capture this invocation's explicit generated inputs first, so a
+        // dependency snapshot cannot hide their current contents.
+        invocation.dependencies = self.dependencies(args, &mut invocation.trees)?;
         let request = serde_json::to_vec(&invocation)?;
         let request_key = Self::digest(&request);
         let mut references = self
@@ -1141,6 +1450,8 @@ impl Prepared {
             .await?
             .path;
         references.insert(request_path.clone());
+        self.pin(&mut daemon, &request_path.to_absolute_path(&store_dir))
+            .await?;
         let name = format!("stock-cargo-{}", &request_key[..24]);
         let drv = Derivation {
             name: StorePathName::from_str(&name)?,
@@ -1167,6 +1478,7 @@ impl Prepared {
         let drv_path = store::add_drv_to_store(&mut daemon, &store_dir, drv, &name)
             .await?
             .to_absolute_path(&store_dir);
+        self.pin(&mut daemon, &drv_path).await?;
         let submitted = started.elapsed().as_secs_f64();
         let mut command = Command::new(&self.config.nix);
         command
@@ -1176,13 +1488,19 @@ impl Prepared {
                 "--option",
                 "substitute",
                 "false",
-                "--no-link",
                 "--json",
                 "--log-format",
                 "internal-json",
                 "--print-build-logs",
             ])
             .arg(format!("{}^out", drv_path.display()));
+        if let Some(directory) = &self.config.gc_roots {
+            command
+                .arg("--out-link")
+                .arg(directory.join(format!("result-{request_key}")));
+        } else {
+            command.arg("--no-link");
+        }
         let mut log = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1343,10 +1661,11 @@ impl Prepared {
             }
         }
         let delivered = Delivered {
-            version: 4,
+            version: 5,
             compiler_status: Some(raw_status),
             owned: owned_paths,
             files,
+            trees: invocation.trees.clone(),
         };
         for (input, target) in &owned {
             if target.extension() == Some(OsStr::new("rmeta"))
@@ -1678,6 +1997,261 @@ impl Prepared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn source_scope_prunes_disjoint_local_and_packaged_roots() {
+        let trees: BTreeMap<_, _> = [
+            ("/build/workspace", "workspace-input"),
+            ("/build/local", "local-input"),
+            ("/build/vendor/registry/crate-1.0", "vendor-input"),
+            ("/nix/store/packaged", "packaged-input"),
+        ]
+        .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
+        .into();
+        for (root, input) in &trees {
+            let selected = Prepared::source_trees(&trees, &root.join("src"), [], []);
+            assert_eq!(selected.len(), 1, "owner: {}", root.display());
+            assert_eq!(selected.get(root), Some(input));
+        }
+        // Selection must leave the complete prepared map available for fallback.
+        assert_eq!(trees.len(), 4);
+    }
+
+    #[test]
+    fn source_scope_distinguishes_nix_build_top_from_declared_build_roots() {
+        let trees: BTreeMap<_, _> = [
+            ("/build/cargo-dyndrv/workspace", "workspace-input"),
+            ("/build/cargo-dyndrv/sources/local", "local-input"),
+            (
+                "/build/cargo-dyndrv/vendor/registry/pkg-1.0",
+                "vendor-input",
+            ),
+        ]
+        .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
+        .into();
+        let infrastructure = [(b"NIX_BUILD_TOP".as_slice(), b"/build".as_slice())];
+        for (root, input) in &trees {
+            let selected = Prepared::source_trees(&trees, root, [], infrastructure);
+            assert_eq!(selected, BTreeMap::from([(root.clone(), input.clone())]));
+        }
+        let cwd = Path::new("/build/cargo-dyndrv/sources/local");
+        let environment = [
+            infrastructure[0],
+            (b"DATA_ROOT".as_slice(), b"/build".as_slice()),
+        ];
+        assert_eq!(Prepared::source_trees(&trees, cwd, [], environment), trees);
+        assert_eq!(
+            Prepared::source_trees(&trees, cwd, [b"--data=/build".as_slice()], infrastructure),
+            trees,
+        );
+    }
+
+    #[test]
+    fn source_scope_keeps_argument_and_effective_environment_references() {
+        let trees: BTreeMap<_, _> = [
+            ("/build/workspace", "workspace-input"),
+            ("/build/external", "external-input"),
+            ("/build/unrelated", "unrelated-input"),
+        ]
+        .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
+        .into();
+        let cwd = Path::new("/build/workspace");
+        for value in [
+            b"/build/external".as_slice(),
+            b"/build/external/", // A trailing slash must not mean `/`.
+            b"-Lnative=/build/external/lib",
+            b"-L/build/external/lib",
+            b"--extern=helper=/build/external/helper.rlib",
+            b"link-args=-Wl,-rpath,/build/external/lib",
+            b"@/build/external/response-file",
+            b"/unrelated:/build/external/data:/another",
+            b"\"/build/external/data\"",
+            b"\xff/build/external/\xfe",
+            b"/build//external/data",
+        ] {
+            let selected = Prepared::source_trees(&trees, cwd, [value], []);
+            assert_eq!(selected.len(), 2, "reference: {value:?}");
+            assert_eq!(
+                selected.get(Path::new("/build/external")),
+                trees.get(Path::new("/build/external"))
+            );
+        }
+        let arguments = [
+            OsString::from("src/lib.rs"),
+            OsString::from("--cfg=feature=demo"),
+        ];
+        // This is the effective (already policy-filtered) environment, matching
+        // invocation's input. Omitted ambient values are deliberately absent.
+        let environment = [(
+            b"RESOURCE_ROOT".as_slice(),
+            b"/build/external/assets".as_slice(),
+        )];
+        let selected = Prepared::source_trees(
+            &trees,
+            cwd,
+            arguments.iter().map(|value| value.as_bytes()),
+            environment,
+        );
+        assert!(selected.contains_key(Path::new("/build/external")));
+        assert!(!selected.contains_key(Path::new("/build/unrelated")));
+    }
+
+    #[test]
+    fn source_scope_respects_prefix_boundaries_and_explicit_ancestors() {
+        let trees: BTreeMap<_, _> = [
+            ("/build/workspace", "workspace-input"),
+            ("/build/external/pkg", "package-input"),
+            ("/build/external/pkg-other", "other-input"),
+            ("/build/elsewhere", "unrelated-input"),
+        ]
+        .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
+        .into();
+        let cwd = Path::new("/build/workspace");
+        let selected = Prepared::source_trees(
+            &trees,
+            cwd,
+            [b"/build/external/pkg-other/src/lib.rs".as_slice()],
+            [],
+        );
+        assert_eq!(selected.len(), 2);
+        assert!(!selected.contains_key(Path::new("/build/external/pkg")));
+        for value in [b"BASE=/build/external".as_slice(), b"BASE=/build/external/"] {
+            let selected = Prepared::source_trees(&trees, cwd, [value], []);
+            assert_eq!(selected.len(), 3, "ancestor: {value:?}");
+            assert!(!selected.contains_key(Path::new("/build/elsewhere")));
+        }
+    }
+
+    #[test]
+    fn source_scope_preserves_non_utf8_and_delimited_root_names() {
+        let root = PathBuf::from(OsString::from_vec(b"/build/external =\xff".to_vec()));
+        let trees = BTreeMap::from([
+            (
+                PathBuf::from("/build/workspace"),
+                PathBuf::from("workspace-input"),
+            ),
+            (root.clone(), PathBuf::from("external-input")),
+            (
+                PathBuf::from("/build/unrelated"),
+                PathBuf::from("unrelated-input"),
+            ),
+        ]);
+        let selected = Prepared::source_trees(
+            &trees,
+            Path::new("/build/workspace"),
+            [b"--data=/build/external =\xff/file".as_slice()],
+            [],
+        );
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected.get(&root), trees.get(&root));
+    }
+
+    #[test]
+    fn source_scope_keeps_layout_for_traversal_and_unknown_owners() {
+        let trees: BTreeMap<_, _> = [
+            ("/build/workspace", "workspace-input"),
+            ("/build/external", "external-input"),
+            ("/build/unrelated", "unrelated-input"),
+        ]
+        .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
+        .into();
+        for value in [
+            b"../external/data".as_slice(),
+            b"BASE=..",
+            b"/build/workspace/../external/data",
+            b"/build/./external",
+        ] {
+            assert_eq!(
+                Prepared::source_trees(&trees, Path::new("/build/workspace"), [value], []),
+                trees
+            );
+        }
+        for cwd in ["/build/mirror", "/build/target/generated", "/build"] {
+            assert_eq!(
+                Prepared::source_trees(&trees, Path::new(cwd), [], []),
+                trees
+            );
+        }
+    }
+
+    #[test]
+    fn source_scope_keeps_complete_overlapping_groups() {
+        // Preparation still rejects nested declarations. Exercise selection's
+        // defensive closure independently, including a separately captured
+        // generated tree: source snapshots do not contain target contents.
+        let trees: BTreeMap<_, _> = [
+            ("/build/workspace", "workspace-input"),
+            ("/build/workspace/nested", "nested-input"),
+            ("/build/workspace/target/generated", "generated-input"),
+            ("/build/workspace/sibling", "sibling-input"),
+            ("/build/unrelated", "unrelated-input"),
+        ]
+        .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
+        .into();
+        let selected =
+            Prepared::source_trees(&trees, Path::new("/build/workspace/nested/src"), [], []);
+        assert_eq!(selected.len(), 4);
+        assert_eq!(
+            selected.get(Path::new("/build/workspace/target/generated")),
+            trees.get(Path::new("/build/workspace/target/generated"))
+        );
+        assert!(!selected.contains_key(Path::new("/build/unrelated")));
+    }
+
+    #[test]
+    fn source_scope_invalidation_tracks_every_retained_root_file() {
+        let root = env::temp_dir().join(format!(
+            "dyndrv-source-scope-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let owner = root.join("owner");
+        let unrelated = root.join("unrelated");
+        fs::create_dir_all(owner.join("assets")).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(owner.join("lib.rs"), b"pub fn function() {}").unwrap();
+        fs::write(owner.join("assets/proc-macro-data"), b"first").unwrap();
+        fs::write(unrelated.join("lib.rs"), b"first").unwrap();
+        let snapshot = || {
+            [&owner, &unrelated]
+                .into_iter()
+                .map(|path| {
+                    let nar = store::source_nar(path).unwrap();
+                    (path.to_path_buf(), PathBuf::from(Prepared::digest(&nar)))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = Prepared::source_trees(&snapshot(), &owner, [], []);
+        fs::write(unrelated.join("lib.rs"), b"second").unwrap();
+        assert_eq!(Prepared::source_trees(&snapshot(), &owner, [], []), before);
+        // A non-Rust asset, absent from Cargo/dep-info, still owns the request.
+        fs::write(owner.join("assets/proc-macro-data"), b"second").unwrap();
+        let changed = Prepared::source_trees(&snapshot(), &owner, [], []);
+        assert_ne!(changed, before);
+        let referenced =
+            Prepared::source_trees(&snapshot(), &owner, [unrelated.as_os_str().as_bytes()], []);
+        fs::write(unrelated.join("lib.rs"), b"third").unwrap();
+        assert_ne!(
+            Prepared::source_trees(&snapshot(), &owner, [unrelated.as_os_str().as_bytes()], []),
+            referenced
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maturin_cfg_is_a_probe_but_compilation_is_not() {
+        let args = ["--print", "cfg", "--target", "x86_64-unknown-linux-gnu"].map(OsString::from);
+        assert!(Prepared::is_probe(OsStr::new("rustc"), &args));
+        let mut compilation = args.to_vec();
+        compilation.push("input.rs".into());
+        assert!(!Prepared::is_probe(OsStr::new("rustc"), &compilation));
+    }
 
     #[test]
     fn private_target_policy_is_explicit_and_only_selects_the_workspace_placeholder() {
@@ -1763,16 +2337,19 @@ mod tests {
         ));
         let target = root.join("target");
         fs::create_dir_all(target.join(".dyndrv-delivered")).unwrap();
-        let backend = Prepared {
+        let mut backend = Prepared {
             config: Config {
                 nix: PathBuf::new(),
                 socket: PathBuf::new(),
                 real_store: root.join("store"),
+                store_mode: Default::default(),
+                gc_roots: None,
                 source: root.join("source"),
                 package_sources: Vec::new(),
                 target: target.clone(),
                 inputs: Vec::new(),
                 environment_names: BTreeSet::new(),
+                environment_prefixes: Vec::new(),
                 omitted_environment_names: BTreeSet::new(),
                 incremental: false,
                 incremental_observer: false,
@@ -1812,12 +2389,39 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>()
         };
+        let declared = root.join("source");
+        let generated = target.join("generated");
+        let old_source = PathBuf::from("/nix/store/11111111111111111111111111111111-source");
+        let old_generated = PathBuf::from("/nix/store/22222222222222222222222222222222-generated");
+        let current_source = PathBuf::from("/nix/store/33333333333333333333333333333333-source");
+        let current_generated =
+            PathBuf::from("/nix/store/44444444444444444444444444444444-generated");
+        for input in [
+            &old_source,
+            &old_generated,
+            &current_source,
+            &current_generated,
+        ] {
+            fs::create_dir_all(backend.physical(input).unwrap()).unwrap();
+        }
+        backend
+            .trees
+            .insert(declared.clone(), current_source.clone());
+        fs::create_dir(backend.physical(&old_source).unwrap().join("data")).unwrap();
+        fs::create_dir(backend.physical(&old_generated).unwrap().join("nested")).unwrap();
+        let sources = BTreeMap::from([
+            (declared.clone(), old_source.clone()),
+            (declared.join("data"), old_source.join("data")),
+            (generated.clone(), old_generated.clone()),
+            (generated.join("nested"), old_generated.join("nested")),
+        ]);
         let receipt = |names: &[&str], compiler_status, contents: BTreeMap<PathBuf, PathBuf>| {
             for name in names {
                 fs::write(
                     backend.receipt(&target.join(name)),
                     serde_json::to_vec(&Delivered {
-                        version: 4,
+                        version: 5,
+                        trees: sources.clone(),
                         compiler_status,
                         owned: names.iter().map(|name| target.join(name)).collect(),
                         files: contents.clone(),
@@ -1837,8 +2441,27 @@ mod tests {
         };
         receipt(&["libleaf.rmeta"], None, subset(&["libleaf.rmeta"]));
         let library = args("rlib", "libleaf.rmeta");
-        let early = backend.dependencies(&library).unwrap();
-        assert!(backend.dependencies(&args("bin", "libleaf.rmeta")).is_err());
+        let mut early_trees = BTreeMap::new();
+        let early = backend.dependencies(&library, &mut early_trees).unwrap();
+        assert_eq!(
+            early_trees,
+            BTreeMap::from([
+                (declared.clone(), current_source.clone()),
+                (generated.clone(), old_generated.clone()),
+            ])
+        );
+        // Explicitly captured generated inputs must not be replaced by the
+        // dependency's older snapshot at the same logical location.
+        let mut generated_trees = BTreeMap::from([(generated.clone(), current_generated.clone())]);
+        backend
+            .dependencies(&library, &mut generated_trees)
+            .unwrap();
+        assert_eq!(generated_trees[&generated], current_generated);
+        assert!(
+            backend
+                .dependencies(&args("bin", "libleaf.rmeta"), &mut BTreeMap::new())
+                .is_err()
+        );
         // Middle completed using only leaf metadata. Its immutable receipt
         // cannot retrospectively contain the then-unfinished leaf archive.
         receipt(
@@ -1848,7 +2471,7 @@ mod tests {
         );
         assert!(
             backend
-                .dependencies(&args("bin", "libmiddle.rlib"))
+                .dependencies(&args("bin", "libmiddle.rlib"), &mut BTreeMap::new())
                 .is_err()
         );
         receipt(
@@ -1856,26 +2479,36 @@ mod tests {
             Some(0),
             subset(&["libleaf.rmeta", "libleaf.rlib", "leaf.d"]),
         );
-        assert_eq!(backend.dependencies(&library).unwrap(), early);
         assert_eq!(
             backend
-                .dependencies(&args("bin", "libmiddle.rlib"))
+                .dependencies(&library, &mut BTreeMap::new())
+                .unwrap(),
+            early
+        );
+        assert_eq!(
+            backend
+                .dependencies(&args("bin", "libmiddle.rlib"), &mut BTreeMap::new())
                 .unwrap(),
             files
         );
         assert_eq!(
             backend
-                .dependencies(&args("lib", "libmiddle.rmeta"))
+                .dependencies(&args("lib", "libmiddle.rmeta"), &mut BTreeMap::new())
                 .unwrap(),
             subset(&["libleaf.rmeta", "libmiddle.rmeta"])
         );
         fs::write(target.join("libleaf.rlib"), "tampered archive").unwrap();
         assert!(
             backend
-                .dependencies(&args("bin", "libmiddle.rlib"))
+                .dependencies(&args("bin", "libmiddle.rlib"), &mut BTreeMap::new())
                 .is_err()
         );
-        assert_eq!(backend.dependencies(&library).unwrap(), early);
+        assert_eq!(
+            backend
+                .dependencies(&library, &mut BTreeMap::new())
+                .unwrap(),
+            early
+        );
         assert!(backend.snapshot_references().is_err());
         fs::write(target.join("libleaf.rlib"), "libleaf.rlib").unwrap();
         let snapshot = backend.snapshot_references().unwrap();
@@ -1883,9 +2516,11 @@ mod tests {
         assert_eq!(snapshot.incremental_children, 0);
         assert_eq!(
             snapshot.store_paths,
-            BTreeSet::from([PathBuf::from(
-                "/nix/store/00000000000000000000000000000000-fixture"
-            )])
+            BTreeSet::from([
+                PathBuf::from("/nix/store/00000000000000000000000000000000-fixture"),
+                old_source,
+                old_generated,
+            ])
         );
         // Expected compile-fail tests retain dep-info from finished rustc
         // failures. Snapshot ownership is distinct from link readiness.
@@ -1895,7 +2530,11 @@ mod tests {
         let failed_probe = backend.snapshot_references().unwrap();
         assert_eq!(failed_probe.owned_files, snapshot.owned_files);
         assert_eq!(failed_probe.store_paths, snapshot.store_paths);
-        assert!(backend.dependencies(&args("bin", "leaf.d")).is_err());
+        assert!(
+            backend
+                .dependencies(&args("bin", "leaf.d"), &mut BTreeMap::new())
+                .is_err()
+        );
         fs::write(target.join("leaf.d"), "changed failed-probe artifact").unwrap();
         assert!(backend.snapshot_references().is_err());
         fs::write(target.join("leaf.d"), "leaf.d").unwrap();
@@ -1965,11 +2604,14 @@ mod tests {
                 nix: PathBuf::new(),
                 socket: PathBuf::new(),
                 real_store: root.join("store"),
+                store_mode: Default::default(),
+                gc_roots: None,
                 source: root.join("source"),
                 package_sources: Vec::new(),
                 target: target.clone(),
                 inputs: Vec::new(),
                 environment_names: BTreeSet::new(),
+                environment_prefixes: Vec::new(),
                 omitted_environment_names: BTreeSet::new(),
                 incremental: false,
                 incremental_observer: false,
@@ -2001,7 +2643,8 @@ mod tests {
             fs::write(
                 backend.receipt(&local),
                 serde_json::to_vec(&Delivered {
-                    version: 4,
+                    version: 5,
+                    trees: BTreeMap::new(),
                     compiler_status: Some(0),
                     owned: BTreeSet::from([local.clone()]),
                     files,
@@ -2020,28 +2663,34 @@ mod tests {
             OsString::from("--extern"),
             OsString::from("proc_macro"),
         ];
-        assert_eq!(backend.dependencies(&args).unwrap(), inputs);
+        assert_eq!(
+            backend.dependencies(&args, &mut BTreeMap::new()).unwrap(),
+            inputs
+        );
         fs::write(&shared, "changed transitive input").unwrap();
         assert!(
             backend
-                .dependencies(&args)
+                .dependencies(&args, &mut BTreeMap::new())
                 .unwrap_err()
                 .to_string()
                 .contains("differs from immutable input")
         );
         fs::write(&shared, "shared.rlib").unwrap();
-        assert_eq!(backend.dependencies(&args).unwrap(), inputs);
+        assert_eq!(
+            backend.dependencies(&args, &mut BTreeMap::new()).unwrap(),
+            inputs
+        );
         write_receipt("right.rlib", &immutable_root.join("conflicting-owner.rlib"));
         assert!(
             backend
-                .dependencies(&args)
+                .dependencies(&args, &mut BTreeMap::new())
                 .unwrap_err()
                 .to_string()
                 .contains("conflicting dependency owners")
         );
         write_receipt("right.rlib", &inputs[&shared]);
         fs::remove_file(&shared).unwrap();
-        assert!(backend.dependencies(&args).is_err());
+        assert!(backend.dependencies(&args, &mut BTreeMap::new()).is_err());
         let local = target.join("left.rlib");
         let own_object = target.join("left.rcgu.o");
         let dependency_object = target.join("shared.rcgu.o");
@@ -2050,7 +2699,8 @@ mod tests {
             .publish_receipt(
                 &local,
                 &Delivered {
-                    version: 4,
+                    version: 5,
+                    trees: BTreeMap::new(),
                     compiler_status: Some(1 << 8),
                     owned: BTreeSet::from([local.clone(), own_object.clone()]),
                     files: BTreeMap::from([

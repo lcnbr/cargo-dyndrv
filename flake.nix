@@ -27,6 +27,8 @@
             cargo
             rustfmt
             clippy
+            (pkgs.python3.withPackages (ps: [ ps.tomli-w ]))
+            ruff
 
             gdb
             rust-analyzer
@@ -35,7 +37,13 @@
           # For some reason nixpkgs cargo will accept unstable features.
           # If it didn't we could use __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly
           # or cargo (but not rustc) from fenix
-          inherit (pkgs.cargo-dyndrv) BUILD_WRAP COMPILE_WRAP SOURCE_WRAP ENV_WRAP TARGET_ENV;
+          inherit (pkgs.cargo-dyndrv)
+            BUILD_WRAP
+            COMPILE_WRAP
+            SOURCE_WRAP
+            ENV_WRAP
+            TARGET_ENV
+            ;
         };
         cross =
           let
@@ -59,7 +67,13 @@
             "CARGO_TARGET_${pkgs'.stdenv.buildPlatform.rust.cargoEnvVarTarget}_LINKER" = HOST_CC;
             "CARGO_TARGET_${pkgs'.hostPlatform.rust.cargoEnvVarTarget}_LINKER" = lib.getExe pkgs'.stdenv.cc;
 
-            inherit (pkgs'.cargo-dyndrv) BUILD_WRAP COMPILE_WRAP SOURCE_WRAP ENV_WRAP TARGET_ENV;
+            inherit (pkgs'.cargo-dyndrv)
+              BUILD_WRAP
+              COMPILE_WRAP
+              SOURCE_WRAP
+              ENV_WRAP
+              TARGET_ENV
+              ;
           };
       });
 
@@ -101,6 +115,9 @@
               outputHashes."harmonia-file-core-3.1.0" = "sha256-hPdQB+DWc/q6w/wnTVGCS8iugEGd60Ym3x2eWvVw3ss=";
             };
 
+            cargoTestFlags = [ "--workspace" ];
+            checkFlags = [ "--test-threads=1" ];
+
             cargoBuildFlags = [
               "--bin"
               pname
@@ -120,6 +137,7 @@
           };
         in
         {
+          cargo-dyndrv-worker = final.callPackage ./nix/worker.nix { };
           cargo-dyndrv = final.rustPlatform.buildRustPackage baseArgs;
           cargo-dyndrv-dyn = final.buildDynamicCrate (
             baseArgs
@@ -135,6 +153,7 @@
       packages = forAllSystems (pkgs: {
         inherit (pkgs)
           cargo-dyndrv
+          cargo-dyndrv-worker
           cargo-dyndrv-dyn
           writeExtern
           buildDynamicCrate

@@ -85,7 +85,12 @@ impl Session {
         } else {
             (&rustdoc, arguments, "rustdoc")
         };
-        let native_doctest = session.nix.is_some() && Self::is_doctest(role, arguments);
+        let native_rustdoc = session.nix.is_some() && role == "rustdoc";
+        let execution = if Self::is_doctest(role, arguments) {
+            "native-doctest"
+        } else {
+            "native-rustdoc"
+        };
         let mut environment_names: Vec<_> = std::env::vars_os()
             .map(|(name, _)| name.as_bytes().to_vec())
             .collect();
@@ -103,7 +108,7 @@ impl Session {
             // Effective-environment replay requires a separate explicit contract.
             "environmentNames": environment_names,
             "jobserver": std::env::var_os("CARGO_MAKEFLAGS").map(|value| value.as_bytes().to_vec()),
-            "execution": if native_doctest { "native-doctest" } else if session.nix.is_some() { "nix-request-or-native-probe" } else { "native-exec-not-nix" },
+            "execution": if native_rustdoc { execution } else if session.nix.is_some() { "nix-request-or-native-probe" } else { "native-exec-not-nix" },
         });
         let destination = root
             .join("invocations")
@@ -116,16 +121,16 @@ impl Session {
         serde_json::to_writer(&mut file, &observation)?;
         file.write_all(b"\n")?;
         drop(file);
-        if native_doctest {
-            // Stable rustdoc has no compiler-wrapper hook. Keep its compilation
-            // and runtime together, execute on every call, and measure this
-            // explicitly native stage without serializing private runtime env.
+        if native_rustdoc {
+            // Rustdoc runs as the caller, like build scripts and doctests. Its
+            // dependencies still cross the immutable compiler boundary; record
+            // native execution separately from Nix compiler delivery.
             let started = Instant::now();
             let status = Command::new(program).args(arguments).status()?;
             fs::write(
                 destination.with_extension("native-result.json"),
                 serde_json::to_vec(&serde_json::json!({
-                    "execution": "native-doctest",
+                    "execution": execution,
                     "status": status.into_raw(),
                     "seconds": started.elapsed().as_secs_f64(),
                 }))?,
@@ -174,7 +179,7 @@ impl Session {
                 let program =
                     OsString::from_vec(serde_json::from_value(record["program"].clone())?);
                 let (extension, expected): (&str, &[u8]) =
-                    if Self::is_doctest(record["role"].as_str().unwrap_or_default(), &arguments) {
+                    if record["role"].as_str() == Some("rustdoc") {
                         ("native-complete", b"executed\n")
                     } else {
                         ("nix-complete", b"delivered\n")
@@ -386,6 +391,20 @@ mod tests {
         .unwrap();
         // Cached compiler delivery cannot stand in for actual doctest execution.
         fs::write(record.with_extension("nix-complete"), b"delivered\n").unwrap();
+        assert!(session.run_cargo(&root, &mut success).is_err());
+        fs::write(record.with_extension("native-complete"), b"executed\n").unwrap();
+        assert!(session.run_cargo(&root, &mut success).unwrap().success());
+        fs::remove_file(root.join("cargo-result.json")).unwrap();
+        fs::write(
+            &record,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1, "role": "rustdoc", "program": b"rustdoc".as_slice(),
+                "arguments": [b"lib.rs".as_slice()]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(record.with_extension("native-complete")).unwrap();
         assert!(session.run_cargo(&root, &mut success).is_err());
         fs::write(record.with_extension("native-complete"), b"executed\n").unwrap();
         assert!(session.run_cargo(&root, &mut success).unwrap().success());

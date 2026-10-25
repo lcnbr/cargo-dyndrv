@@ -8,10 +8,11 @@ and delivers its outputs to the same Cargo target directory.
 
 The implemented entry points are `capture-cargo`, `nix-cargo` and
 `snapshot-references`. They do not require a patched Cargo, a custom unit-graph
-export or a Nix source patch. The validated Nix mode uses a separately owned
-Linux worker and private daemon. Packaging that worker inside an ordinary Nix
-builder is a separate integration boundary; enabling the existing overlay does
-not provide this lifecycle automatically.
+export or a Nix source patch. The separately packaged
+#link("worker.typ")[`cargo-dyndrv-worker`] owns the Linux lifecycle around these
+low-level entry points, with private or administrator-configured system stores.
+It runs on the host; packaging a nested daemon inside an ordinary Nix builder
+remains a separate integration boundary.
 
 == Invoke the existing workload
 
