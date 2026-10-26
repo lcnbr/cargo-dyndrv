@@ -2051,6 +2051,7 @@ impl Prepared {
         if let Some(products) = products {
             products.report(&invocation.incremental.as_ref().unwrap().directory)?;
         }
+        let source_verification_started = Instant::now();
         for (destination, input) in &invocation.trees {
             if destination != input {
                 source_wrap::verify_unchanged(
@@ -2060,11 +2061,16 @@ impl Prepared {
                 )?;
             }
         }
+        let source_verification_seconds = source_verification_started.elapsed().as_secs_f64();
+        let dependency_verification_started = Instant::now();
         for (target, input) in &invocation.dependencies {
             if !same_contents(target, input)? {
                 bail!("compiler changed dependency input")
             }
         }
+        let dependency_verification_seconds =
+            dependency_verification_started.elapsed().as_secs_f64();
+        let artifact_publication_started = Instant::now();
         // Nix may mount /tmp and /build on different filesystems. Keep the
         // hard-link staging inside the writable output, including when its
         // parent is a read-only generated input tree.
@@ -2091,9 +2097,13 @@ impl Prepared {
         }
         fs::create_dir(&output)?;
         compile_wrap::publish(&stage, &output.join("artifacts"))?;
+        let artifact_publication_seconds = artifact_publication_started.elapsed().as_secs_f64();
+        let incremental_publication_started = Instant::now();
         if let Some(state) = &invocation.incremental {
             state.publish(&output)?;
         }
+        let incremental_publication_seconds =
+            incremental_publication_started.elapsed().as_secs_f64();
         fs::write(output.join("stdout"), result.stdout)?;
         fs::write(output.join("stderr"), result.stderr)?;
         // A failed compiler result is data, not a failed Nix transport. Cargo
@@ -2102,7 +2112,11 @@ impl Prepared {
         eprintln!(
             "DYNDRV_STOCK_OUTPUT_PUBLISHED {}",
             serde_json::json!({
-                "verificationAndPublicationSeconds": publication_started.elapsed().as_secs_f64()
+                "verificationAndPublicationSeconds": publication_started.elapsed().as_secs_f64(),
+                "sourceVerificationSeconds": source_verification_seconds,
+                "dependencyVerificationSeconds": dependency_verification_seconds,
+                "artifactPublicationSeconds": artifact_publication_seconds,
+                "incrementalPublicationSeconds": incremental_publication_seconds
             })
         );
         Ok(())

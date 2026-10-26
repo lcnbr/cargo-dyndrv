@@ -24,6 +24,47 @@ import worker
 
 
 class WorkerPolicyTests(unittest.TestCase):
+    def test_source_overlay_defaults_to_false_and_accepts_booleans(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for option, expected in (
+                ({}, False),
+                ({"source_overlay": False}, False),
+                ({"source_overlay": True}, True),
+            ):
+                with self.subTest(option=option):
+                    (root / "environment.json").write_text(
+                        json.dumps({"environment": {}, **option})
+                    )
+                    with (
+                        mock.patch.dict(
+                            os.environ, {"CARGO_DYNDRV_STORE": "private"}, clear=True
+                        ),
+                        mock.patch.object(worker, "Daemon"),
+                        mock.patch.object(worker, "private_directory"),
+                    ):
+                        runner = worker.Worker(root, root, "check", ["check"])
+                    self.assertIs(runner.source_overlay, expected)
+
+    def test_source_overlay_rejects_non_boolean_values_before_store_access(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for value in (None, "false", "true", 0, 1, 0.0, [], {}):
+                with self.subTest(value=value):
+                    (root / "environment.json").write_text(
+                        json.dumps({"environment": {}, "source_overlay": value})
+                    )
+                    with (
+                        mock.patch.object(worker, "Daemon") as daemon,
+                        mock.patch.object(worker, "private_directory") as directory,
+                        self.assertRaisesRegex(
+                            ValueError, "source_overlay must be a boolean"
+                        ),
+                    ):
+                        worker.Worker(root, root, "check", ["check"])
+                    daemon.assert_not_called()
+                    directory.assert_not_called()
+
     def test_source_roots_preserve_lexical_ancestry_and_raw_strings(self):
         for packages, expected in (
             (

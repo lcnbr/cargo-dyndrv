@@ -1,10 +1,10 @@
 //! Source materialization with an explicitly owned compiler output file or subtree.
-use std::{
-    fs,
-    io::{self, Read},
-    os::unix::fs::PermissionsExt,
-    path::Path,
-};
+use std::fs::{self, Permissions};
+#[cfg(target_os = "linux")]
+use std::io::Result as IoResult;
+use std::io::{self, Read};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 pub mod generated;
 #[cfg(target_os = "linux")]
@@ -126,7 +126,7 @@ impl Materializer {
             Self::Copy => copy_tree(&source, &destination)?,
             #[cfg(target_os = "linux")]
             Self::Overlay(mounts) => {
-                mounts.materialize(&source, &destination)?;
+                mounts.materialize(&source, &destination, writable)?;
                 fs::set_permissions(
                     &destination,
                     fs::Permissions::from_mode(readonly_mode(&source)?),
@@ -160,6 +160,48 @@ impl Materializer {
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_upper(
+        source: &Path,
+        destination: &Path,
+        upper: &Path,
+        writable: &[Writable<'_>],
+    ) -> IoResult<()> {
+        // Lower inodes can belong to an unmapped store owner. Prepare owned
+        // copies before mounting; chmod cannot make those lower inodes ours.
+        // Copy each directory output whole, preserving its existing inputs.
+        if writable
+            .iter()
+            .any(|output| matches!(output, Writable::Directory(path) if *path == destination))
+        {
+            return copy_tree_contents(source, upper);
+        }
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            if !writable
+                .iter()
+                .any(|output| output.path().starts_with(&target))
+            {
+                continue;
+            }
+            let upper_target = upper.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                fs::create_dir(&upper_target)?;
+                Self::prepare_upper(&entry.path(), &target, &upper_target, writable)?;
+            } else {
+                fs::copy(entry.path(), &upper_target)?;
+                fs::set_permissions(
+                    &upper_target,
+                    Permissions::from_mode(readonly_mode(&entry.path())?),
+                )?;
+            }
+        }
+        // Ancestors and scratch directories need owned metadata, not writable
+        // siblings. The shared permission pass applies the exact allowances.
+        fs::set_permissions(upper, Permissions::from_mode(readonly_mode(source)?))
     }
 }
 
@@ -382,6 +424,98 @@ mod tests {
         assert!(Materializer::overlay(&state).is_err());
         assert!(!state.exists());
         assert_eq!(fs::read(root.join("source/input")).unwrap(), b"input");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_upper_preserves_declared_inputs_without_copying_unowned_siblings() {
+        let root = fixture();
+        let source = root.join("source");
+        fs::create_dir_all(source.join("generated/full/nested")).unwrap();
+        fs::create_dir_all(source.join("generated/full/undeclared/deep")).unwrap();
+        fs::create_dir(source.join("generated/empty")).unwrap();
+        fs::create_dir(source.join("scratch")).unwrap();
+        fs::write(source.join("generated/full/nested/input"), b"nested input").unwrap();
+        fs::write(
+            source.join("generated/full/undeclared/deep/input"),
+            b"whole subtree input",
+        )
+        .unwrap();
+        fs::write(source.join("generated/existing"), b"previous output").unwrap();
+        fs::write(source.join("generated/private.rs"), b"private input").unwrap();
+        fs::write(source.join("scratch/input"), b"scratch input").unwrap();
+        fs::set_permissions(source.join("generated"), Permissions::from_mode(0o751)).unwrap();
+        let immutable = root.join("immutable");
+        copy_tree(&source, &immutable).unwrap();
+        for reversed in [false, true] {
+            let upper = root.join(if reversed { "reversed-upper" } else { "upper" });
+            fs::create_dir(&upper).unwrap();
+            let full = upper.join("generated/full");
+            let nested = full.join("nested");
+            let nested_file = nested.join("input");
+            let empty = upper.join("generated/empty");
+            let existing = upper.join("generated/existing");
+            let absent = upper.join("generated/absent");
+            let scratch = upper.join("scratch");
+            let mut writable = [
+                Writable::Directory(&nested),
+                Writable::File(&nested_file),
+                Writable::ScratchDirectory(&nested),
+                Writable::Directory(&full),
+                Writable::Directory(&empty),
+                Writable::File(&existing),
+                Writable::File(&absent),
+                Writable::ScratchDirectory(&scratch),
+            ];
+            if reversed {
+                writable.reverse();
+            }
+            validate_output(&immutable, &upper, &writable).unwrap();
+            Materializer::prepare_upper(&immutable, &upper, &upper, &writable).unwrap();
+            assert_eq!(fs::read(&nested_file).unwrap(), b"nested input");
+            assert_eq!(
+                fs::read(full.join("undeclared/deep/input")).unwrap(),
+                b"whole subtree input"
+            );
+            assert_eq!(fs::read(&existing).unwrap(), b"previous output");
+            assert!(empty.is_dir());
+            assert!(fs::read_dir(&empty).unwrap().next().is_none());
+            for relative in [
+                "input",
+                "generated/private.rs",
+                "scratch/input",
+                "generated/absent",
+            ] {
+                assert!(!upper.join(relative).exists(), "{relative}");
+            }
+            for relative in [
+                "",
+                "generated",
+                "generated/full",
+                "generated/full/nested",
+                "generated/full/nested/input",
+                "generated/full/undeclared",
+                "generated/full/undeclared/deep",
+                "generated/full/undeclared/deep/input",
+                "generated/empty",
+                "generated/existing",
+                "scratch",
+            ] {
+                assert_eq!(
+                    fs::symlink_metadata(upper.join(relative))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    readonly_mode(&immutable.join(relative)).unwrap(),
+                    "{relative}"
+                );
+            }
+            verify_unchanged(&source, &immutable, &[]).unwrap();
+            make_writable(&upper).unwrap();
+        }
+        make_writable(&immutable).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

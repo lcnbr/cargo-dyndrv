@@ -1,4 +1,5 @@
 //! Private Linux mounts owned by one single-threaded compiler builder.
+use super::{Materializer, Writable};
 use std::{
     ffi::{CString, c_char, c_int, c_ulong, c_void},
     fs, io,
@@ -74,7 +75,12 @@ impl Mounts {
         })
     }
 
-    pub(super) fn materialize(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
+    pub(super) fn materialize(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        writable: &[Writable<'_>],
+    ) -> io::Result<()> {
         if !source.starts_with("/nix/store")
             || source == Path::new("/nix/store")
             || !["/build", "/tmp"]
@@ -101,6 +107,7 @@ impl Mounts {
         let work = state.join("work");
         fs::create_dir(&upper)?;
         fs::create_dir(&work)?;
+        Materializer::prepare_upper(source, destination, &upper, writable)?;
         // mount(2)'s option list uses commas and colons as delimiters. Reject
         // ambiguous paths instead of allowing them to select another input.
         let mut options = Vec::new();

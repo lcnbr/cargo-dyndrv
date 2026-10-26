@@ -387,6 +387,10 @@ class Worker:
     def __init__(self, bootstrap, workspace, action, arguments):
         self.bootstrap = bootstrap
         self.spec = json.loads((bootstrap / "environment.json").read_text())
+        self.source_overlay = self.spec.get("source_overlay", False)
+        if not isinstance(self.source_overlay, bool):
+            # Bootstrap errors use the CLI's configuration diagnostic handler.
+            raise ValueError("source_overlay must be a boolean")  # noqa: TRY004
         self.runtime_names = RUNTIME_NAMES | set(
             self.spec.get("runtime_environment_names", [])
         )
@@ -1176,6 +1180,7 @@ class Worker:
                     "real_store": str(self.daemon.store_root),
                     "store_mode": self.daemon.mode,
                     "source": layout["workspace"],
+                    "source_overlay": self.source_overlay,
                     "target": str(self.logical / "target"),
                     "inputs": sorted({*self.spec["inputs"], *extra_inputs}),
                     "package_sources": sorted(packages),

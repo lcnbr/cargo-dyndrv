@@ -38,6 +38,14 @@ The environment specification contains:
 - `inputs`: immutable compiler/native-tool store roots.
 - `nix`, `cargo`, `rustdoc`, `driver`, `nextest`, `python`: absolute executables.
 - `runtime_path`: executable search path for the Cargo session and source staging.
+- `source_overlay`: optional boolean, defaults to `false`. Set `true` to opt into
+  the backend's source overlay materialization. This requires Linux overlayfs
+  support inside the compiler's build namespace, including nested overlays when
+  the underlying filesystem is already an overlay. Unsupported configurations
+  fail with an error; there is no silent fallback to copying. Post-compiler
+  source-byte validation remains enabled. The complete `environment.json` is
+  hashed into the target policy, so enabled and disabled configurations use
+  separate targets. The performance benefit depends on the workload and storage.
 - `vendor_expression`: a Nix expression producing a Cargo vendor directory with
   `config.toml`. Its lockfile is supplied as `CARGO_DYNDRV_CARGO_LOCK`; the worker
   strips declared private values before invoking Nix. The vendor provider can use
@@ -153,6 +161,13 @@ cover their named operations; their sum does not include every setup or export
 step. They contain no environment values. Driver preparation details live in the
 session's `prepare.json`; worker phase boundaries do not infer Cargo start times
 from files left by an incomplete session.
+
+Builder logs retain `DYNDRV_STOCK_OUTPUT_PUBLISHED` with the existing
+`verificationAndPublicationSeconds` total and the nested
+`sourceVerificationSeconds`, `dependencyVerificationSeconds`,
+`artifactPublicationSeconds` and `incrementalPublicationSeconds` components.
+The total also includes optional observation and final status/log writes.
+These intervals are inside compiler realization, not additional driver phases.
 
 == Qualification
 
