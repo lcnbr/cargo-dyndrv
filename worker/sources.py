@@ -123,6 +123,7 @@ class SourceLayout:
             raise ValueError(f"cannot inventory source root without JJ or Git: {root}")
         if self._excluded(root.relative_to(repository)):
             raise ValueError(f"source root is in an excluded repository path: {root}")
+        whole_repository = root == repository
         paths = set()
         for name in self._run(command, repository).split(b"\0"):
             if not name:
@@ -133,8 +134,10 @@ class SourceLayout:
             path = repository / relative
             # Deleted tracked files remain in Git's index.
             if (
-                path.is_relative_to(root)
-                and not self._excluded(path.relative_to(root))
+                (whole_repository or path.is_relative_to(root))
+                and not self._excluded(
+                    relative if whole_repository else path.relative_to(root)
+                )
                 and (path.exists() or path.is_symlink())
             ):
                 paths.add(path)
@@ -397,6 +400,18 @@ class SourceLayout:
         selected = set().union(*inventories.values())
 
         def expand(source, ancestors):
+            # Check the expanded alias name; directory symlinks can expose
+            # declarations under new names. The final plan visits every source.
+            if (
+                discovering
+                and source.name != "Cargo.toml"
+                and not (
+                    source.name in {"config", "config.toml"}
+                    and source.parent.name == ".cargo"
+                )
+                and not source.is_symlink()
+            ):
+                return
             try:
                 resolved = source.resolve(strict=True)
             except (OSError, RuntimeError) as error:

@@ -720,6 +720,41 @@ class SourceLayoutTests(unittest.TestCase):
         self.assertFalse((Path(result["workspace"]) / "outside").exists())
         self.assertFalse((Path(result["workspace"]) / ".git").exists())
 
+    def test_discovery_skips_payload_resolution_but_full_plan_preserves_preflight(self):
+        metadata = self.metadata()
+        payload = self.workspace / "assets/payload"
+        self.write(payload, "ordinary source bytes")
+        self.command("git", "add", "assets/payload")
+        layout = self.layout()
+        layout.prepare(metadata)
+        self.write(self.stage / "workspace/retained", "retain until preflight passes")
+        before = self.stage_state()
+        original_resolve = Path.resolve
+
+        def resolve(path, *arguments, **options):
+            if path == payload:
+                self.fail("discovery resolved an ordinary payload")
+            return original_resolve(path, *arguments, **options)
+
+        with mock.patch.object(Path, "resolve", resolve):
+            layout._discover(metadata)
+        self.assertEqual(self.stage_state(), before)
+        outside = self.directory / "outside-payload"
+        self.write(outside, "outside declared roots")
+        for case, error in (
+            ("fifo", "special source"),
+            ("escape", "escapes declared roots"),
+        ):
+            with self.subTest(case=case):
+                payload.unlink()
+                if case == "fifo":
+                    os.mkfifo(payload)
+                else:
+                    payload.symlink_to(outside)
+                with self.assertRaisesRegex(ValueError, error):
+                    layout.prepare(metadata)
+                self.assertEqual(self.stage_state(), before)
+
     def test_all_manifests_and_special_files_are_validated_before_stale_deletion(self):
         metadata = self.metadata()
         self.layout().prepare(metadata)
