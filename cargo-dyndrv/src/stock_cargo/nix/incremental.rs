@@ -3,6 +3,7 @@
 use super::{CompilerOutput, Prepared};
 use color_eyre::eyre::{self, Context, bail};
 use serde::{Deserialize, Serialize};
+use source_wrap::Verifier;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
@@ -225,7 +226,7 @@ impl State {
 
     // mtime and writable bits are intentionally transport properties. File bytes,
     // types, executable bits and the complete directory inventory remain bound.
-    fn verify(input: &Path, local: &Path) -> eyre::Result<()> {
+    fn verify(input: &Path, local: &Path, verifier: &mut Verifier) -> eyre::Result<()> {
         let expected = fs::symlink_metadata(input)?;
         let actual = fs::symlink_metadata(local)?;
         if expected.file_type() != actual.file_type()
@@ -234,7 +235,7 @@ impl State {
             bail!("incremental state type or executable mode changed");
         }
         if expected.is_file() {
-            if !source_wrap::same_contents(input, local)? {
+            if !verifier.same_contents(input, local)? {
                 bail!("incremental state bytes changed");
             }
         } else if expected.is_dir() {
@@ -248,7 +249,7 @@ impl State {
                 bail!("incremental state entries changed");
             }
             for entry in entries {
-                Self::verify(&input.join(&entry), &local.join(entry))?;
+                Self::verify(&input.join(&entry), &local.join(entry), verifier)?;
             }
         } else {
             bail!("incremental state contains a symlink or special file");
@@ -291,7 +292,7 @@ impl State {
             // A missing child is an explicit cold/stripped state, even if its
             // previous immutable owner is unavailable. Never request producer A.
             if local.symlink_metadata().is_ok() {
-                Self::verify(&prior.physical(backend)?, &local)?;
+                Self::verify(&prior.physical(backend)?, &local, &mut Verifier::default())?;
                 self.input = Some(prior.input);
                 self.child = Some(prior.child);
             }
@@ -301,6 +302,7 @@ impl State {
 
     pub(super) fn snapshot_references(
         backend: &Prepared,
+        verifier: &mut Verifier,
     ) -> eyre::Result<(BTreeSet<PathBuf>, usize, Vec<File>)> {
         let directory = backend.config.target.join(".dyndrv-delivered/incremental");
         if !directory.try_exists()? {
@@ -347,7 +349,7 @@ impl State {
             let physical = prior.physical(backend)?;
             let local = prior.directory.join(&prior.child);
             if local.symlink_metadata().is_ok() {
-                Self::verify(&physical, &local)?;
+                Self::verify(&physical, &local, verifier)?;
                 children.insert(local);
             }
             // Retained receipts themselves name their previous immutable input,
@@ -400,7 +402,11 @@ impl State {
             if self.child.as_ref() != Some(&child) {
                 bail!("incremental child ownership changed");
             }
-            Self::verify(&backend.physical(previous)?.join(&child), &destination)?;
+            Self::verify(
+                &backend.physical(previous)?.join(&child),
+                &destination,
+                &mut Verifier::default(),
+            )?;
         } else if destination.symlink_metadata().is_ok() {
             bail!("refusing to replace an unowned incremental child");
         }
@@ -604,9 +610,10 @@ mod tests {
         assert!(cold.input.is_none());
         assert!(make_state().bind(&backend).is_err());
         cold.deliver(&backend, output).unwrap();
-        assert!(State::snapshot_references(&backend).is_err());
+        assert!(State::snapshot_references(&backend, &mut Verifier::default()).is_err());
         drop(lease);
-        let (references, count, leases) = State::snapshot_references(&backend).unwrap();
+        let (references, count, leases) =
+            State::snapshot_references(&backend, &mut Verifier::default()).unwrap();
         assert_eq!(references, BTreeSet::from([output.to_path_buf()]));
         assert_eq!(count, 1);
         assert!(make_state().bind(&backend).is_err());
@@ -621,7 +628,7 @@ mod tests {
         let object = directory.join("rustc-selected-child/session/object.o");
         fs::write(&object, "tampered").unwrap();
         assert!(make_state().bind(&backend).is_err());
-        assert!(State::snapshot_references(&backend).is_err());
+        assert!(State::snapshot_references(&backend, &mut Verifier::default()).is_err());
         fs::write(&object, "owned object").unwrap();
         fs::write(directory.join("rustc-selected-child/unexpected"), "unbound").unwrap();
         assert!(make_state().bind(&backend).is_err());
@@ -637,7 +644,7 @@ mod tests {
         fs::write(&object, "owned object").unwrap();
         fs::rename(&physical, root.join("missing-backing-output")).unwrap();
         assert!(make_state().bind(&backend).is_err());
-        assert!(State::snapshot_references(&backend).is_err());
+        assert!(State::snapshot_references(&backend, &mut Verifier::default()).is_err());
         // The same missing backing output must never matter after stripping.
         fs::remove_dir_all(&directory).unwrap();
         let mut stripped = make_state();
@@ -649,7 +656,8 @@ mod tests {
         assert!(stripped.input.is_none());
         drop(lease);
         fs::rename(root.join("missing-backing-output"), &physical).unwrap();
-        let (references, count, leases) = State::snapshot_references(&backend).unwrap();
+        let (references, count, leases) =
+            State::snapshot_references(&backend, &mut Verifier::default()).unwrap();
         assert_eq!(references, BTreeSet::from([output.to_path_buf()]));
         assert_eq!(count, 0);
         drop(leases);

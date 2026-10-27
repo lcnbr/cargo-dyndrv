@@ -1,6 +1,6 @@
 //! Source materialization with an explicitly owned compiler output file or subtree.
-use std::fs::{self, Permissions};
-#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
+use std::fs::{self, File, Permissions};
 use std::io::Result as IoResult;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
@@ -57,28 +57,71 @@ fn readonly_mode(path: &Path) -> io::Result<u32> {
     Ok(fs::symlink_metadata(path)?.permissions().mode() & 0o777 & !0o222)
 }
 
-/// Compare complete file bytes without allocations proportional to artifact size.
-pub fn same_contents(left: &Path, right: &Path) -> io::Result<bool> {
-    let mut left = fs::File::open(left)?;
-    let mut right = fs::File::open(right)?;
-    let mut remaining = left.metadata()?.len();
-    if remaining != right.metadata()?.len() {
-        return Ok(false);
-    }
-    let mut a = vec![0; remaining.clamp(1, 64 * 1024) as usize];
-    let mut b = vec![0; a.len()];
-    while remaining > 0 {
-        let count = remaining.min(a.len() as u64) as usize;
-        left.read_exact(&mut a[..count])?;
-        right.read_exact(&mut b[..count])?;
-        if a[..count] != b[..count] {
+/// Reusable scratch storage for serial file and source-tree verification.
+///
+/// Each buffer grows lazily to at most 64 KiB. Every check opens and reads its
+/// inputs afresh; no file handles, metadata or equality results are retained.
+///
+/// ```no_run
+/// use source_wrap::Verifier;
+/// use std::io::Result as IoResult;
+/// use std::path::Path;
+///
+/// # fn main() -> IoResult<()> {
+/// let source = Path::new("source");
+/// let copy = Path::new("copy");
+/// let mut verifier = Verifier::default();
+/// assert!(verifier.same_contents(&source.join("input"), &copy.join("input"))?);
+/// verifier.verify_unchanged(source, copy, &[])?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Default)]
+pub struct Verifier {
+    left_buffer: Vec<u8>,
+    right_buffer: Vec<u8>,
+}
+
+/// Compare complete file bytes using temporary scratch storage.
+/// See [`Verifier::same_contents`] for reusable storage and error behavior.
+pub fn same_contents(left: &Path, right: &Path) -> IoResult<bool> {
+    Verifier::default().same_contents(left, right)
+}
+
+impl Verifier {
+    /// Compare complete file bytes without allocations proportional to artifact size.
+    /// See [`Verifier`] for an example.
+    ///
+    /// # Errors
+    /// Returns an I/O error if opening, inspecting or reading either file fails.
+    pub fn same_contents(&mut self, left: &Path, right: &Path) -> IoResult<bool> {
+        let mut left = File::open(left)?;
+        let mut right = File::open(right)?;
+        let mut remaining = left.metadata()?.len();
+        if remaining != right.metadata()?.len() {
             return Ok(false);
         }
-        remaining -= count as u64;
+        let buffer_len = remaining.clamp(1, 64 * 1024) as usize;
+        for buffer in [&mut self.left_buffer, &mut self.right_buffer] {
+            if buffer.len() < buffer_len {
+                buffer.reserve_exact(buffer_len - buffer.len());
+                buffer.resize(buffer_len, 0);
+            }
+        }
+        while remaining > 0 {
+            let count = remaining.min(self.left_buffer.len() as u64) as usize;
+            left.read_exact(&mut self.left_buffer[..count])?;
+            right.read_exact(&mut self.right_buffer[..count])?;
+            if self.left_buffer[..count] != self.right_buffer[..count] {
+                return Ok(false);
+            }
+            remaining -= count as u64;
+        }
+        // Growth during comparison must not turn an equal prefix into acceptance;
+        // read_exact above also rejects truncation before the advertised length.
+        Ok(left.read(&mut self.left_buffer[..1])? == 0
+            && right.read(&mut self.right_buffer[..1])? == 0)
     }
-    // Growth during comparison must not turn an equal prefix into acceptance;
-    // read_exact above also rejects truncation before the advertised length.
-    Ok(left.read(&mut a[..1])? == 0 && right.read(&mut b[..1])? == 0)
 }
 
 /// Source staging changes independently of the post-execution validation.
@@ -314,93 +357,114 @@ pub fn verify_unchanged(
     source: &Path,
     destination: &Path,
     writable: &[Writable<'_>],
-) -> io::Result<()> {
-    validate_output(source, destination, writable)?;
-    verify_tree(source, destination, writable)
+) -> IoResult<()> {
+    Verifier::default().verify_unchanged(source, destination, writable)
 }
 
-fn verify_tree(source: &Path, destination: &Path, writable: &[Writable<'_>]) -> io::Result<()> {
-    if writable.iter().any(|output| {
-        matches!(output, Writable::Directory(path) | Writable::EmptyDirectory(path)
+impl Verifier {
+    /// Verify the materialized source tree after execution using reusable scratch storage.
+    /// A script that changes permissions to write sources is also unsupported.
+    /// See [`Verifier`] for an example.
+    ///
+    /// # Errors
+    /// Returns an error if source validation fails, a protected entry changes,
+    /// an output violates its declared allowance, or an I/O operation fails.
+    pub fn verify_unchanged(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        writable: &[Writable<'_>],
+    ) -> IoResult<()> {
+        validate_output(source, destination, writable)?;
+        self.verify_tree(source, destination, writable)
+    }
+
+    fn verify_tree(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        writable: &[Writable<'_>],
+    ) -> IoResult<()> {
+        if writable.iter().any(|output| {
+            matches!(output, Writable::Directory(path) | Writable::EmptyDirectory(path)
                 if *path == destination)
-    }) {
-        return validate_tree(destination);
-    }
-    let actual = fs::symlink_metadata(destination)?;
-    let expected = fs::symlink_metadata(source)?;
-    let mut expected_mode = readonly_mode(source)?;
-    if writable
-        .iter()
-        .any(|output| matches!(output, Writable::ScratchDirectory(path) if *path == destination))
-    {
-        expected_mode |= 0o200;
-    }
-    let writable_files: std::collections::BTreeSet<_> = writable
-        .iter()
-        .filter_map(|output| match output {
-            Writable::File(path) if path.parent() == Some(destination) => {
-                Some(path.file_name().unwrap())
-            }
-            _ => None,
-        })
-        .collect();
-    if !writable_files.is_empty() {
-        expected_mode |= 0o200;
-    }
-    if actual.file_type() != expected.file_type()
-        || actual.permissions().mode() & 0o777 != expected_mode
-    {
-        return Err(invalid(
-            "workspace source type or mode changed during execution",
-        ));
-    }
-    if expected.is_file() {
-        if !same_contents(source, destination)? {
-            return Err(invalid("workspace source bytes changed during execution"));
+        }) {
+            return validate_tree(destination);
         }
-    } else if expected.is_dir() {
-        let names = |path: &Path| -> io::Result<std::collections::BTreeSet<_>> {
-            fs::read_dir(path)?
-                .filter_map(|entry| match entry {
-                    Ok(entry) if writable_files.contains(entry.file_name().as_os_str()) => None,
-                    other => Some(other.map(|entry| entry.file_name())),
-                })
-                .collect()
-        };
-        if names(source)? != names(destination)? {
-            return Err(invalid("workspace source entries changed during execution"));
+        let actual = fs::symlink_metadata(destination)?;
+        let expected = fs::symlink_metadata(source)?;
+        let mut expected_mode = expected.permissions().mode() & 0o777 & !0o222;
+        if writable.iter().any(
+            |output| matches!(output, Writable::ScratchDirectory(path) if *path == destination),
+        ) {
+            expected_mode |= 0o200;
         }
-        for name in &writable_files {
-            match fs::symlink_metadata(destination.join(name)) {
-                Ok(info) if !info.is_file() => {
-                    return Err(invalid("compiler file output must remain regular"));
+        let writable_files: BTreeSet<_> = writable
+            .iter()
+            .filter_map(|output| match output {
+                Writable::File(path) if path.parent() == Some(destination) => {
+                    Some(path.file_name().unwrap())
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-                _ => {}
-            }
+                _ => None,
+            })
+            .collect();
+        if !writable_files.is_empty() {
+            expected_mode |= 0o200;
         }
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            if writable_files.contains(entry.file_name().as_os_str()) {
-                continue;
-            }
-            verify_tree(
-                &entry.path(),
-                &destination.join(entry.file_name()),
-                writable,
-            )?;
+        if actual.file_type() != expected.file_type()
+            || actual.permissions().mode() & 0o777 != expected_mode
+        {
+            return Err(invalid(
+                "workspace source type or mode changed during execution",
+            ));
         }
-    } else {
-        return Err(invalid("workspace source contains an unsupported entry"));
+        if expected.is_file() {
+            if !self.same_contents(source, destination)? {
+                return Err(invalid("workspace source bytes changed during execution"));
+            }
+        } else if expected.is_dir() {
+            let names = |path: &Path| -> IoResult<Vec<_>> {
+                fs::read_dir(path)?
+                    .filter_map(|entry| match entry {
+                        Ok(entry) if writable_files.contains(entry.file_name().as_os_str()) => None,
+                        other => Some(other.map(|entry| entry.file_name())),
+                    })
+                    .collect()
+            };
+            // Retain source enumeration order for recursion while comparing names as sets.
+            let source_names = names(source)?;
+            let destination_names = names(destination)?;
+            if source_names.iter().collect::<BTreeSet<_>>()
+                != destination_names.iter().collect::<BTreeSet<_>>()
+            {
+                return Err(invalid("workspace source entries changed during execution"));
+            }
+            for name in &writable_files {
+                match fs::symlink_metadata(destination.join(name)) {
+                    Ok(info) if !info.is_file() => {
+                        return Err(invalid("compiler file output must remain regular"));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                    _ => {}
+                }
+            }
+            for name in source_names {
+                self.verify_tree(&source.join(&name), &destination.join(name), writable)?;
+            }
+        } else {
+            return Err(invalid("workspace source contains an unsupported entry"));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::symlink, time::SystemTime};
+    use std::fs::{File, FileTimes};
+    use std::os::unix::fs::symlink;
+    use std::time::SystemTime;
 
     fn fixture() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -524,24 +588,27 @@ mod tests {
         let root = fixture();
         let left = root.join("source/input");
         let right = root.join("other");
-        for length in [0, 1, 65536, 2 * 65536 + 3] {
-            let bytes: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+        let mut verifier = Verifier::default();
+        for length in [0, 1, 65536, 7, 0, 2 * 65536 + 3, 1] {
+            let mut bytes: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
             fs::write(&left, &bytes).unwrap();
             fs::write(&right, &bytes).unwrap();
-            assert!(same_contents(&left, &right).unwrap());
+            assert!(verifier.same_contents(&left, &right).unwrap());
             if length > 0 {
-                let mut changed = bytes.clone();
-                changed[length - 1] ^= 1;
-                fs::write(&right, changed).unwrap();
-                assert!(!same_contents(&left, &right).unwrap());
+                bytes[length - 1] ^= 1;
+                fs::write(&right, &bytes).unwrap();
+                assert!(!verifier.same_contents(&left, &right).unwrap());
+                bytes[length - 1] ^= 1;
             }
-            let mut longer = bytes;
-            longer.push(0);
-            fs::write(&right, longer).unwrap();
-            assert!(!same_contents(&left, &right).unwrap());
+            bytes.push(0);
+            fs::write(&right, bytes).unwrap();
+            assert!(!verifier.same_contents(&left, &right).unwrap());
         }
         fs::remove_file(&right).unwrap();
-        assert!(same_contents(&left, &right).is_err());
+        assert!(verifier.same_contents(&left, &right).is_err());
+        fs::copy(&left, &right).unwrap();
+        assert!(verifier.same_contents(&left, &right).unwrap());
+        assert!(same_contents(&left, &right).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -832,8 +899,12 @@ mod tests {
         let root = fixture();
         let source = root.join("source");
         let copy = root.join("copy");
+        let mut bytes = vec![0; 2 * 65536 + 3];
+        fs::write(source.join("input"), &bytes).unwrap();
         Materializer::Copy.materialize(&source, &copy, &[]).unwrap();
-        verify_unchanged(&source, &copy, &[]).unwrap();
+        let mut verifier = Verifier::default();
+        verifier.verify_unchanged(&source, &copy, &[]).unwrap();
+        let original = fs::metadata(copy.join("input")).unwrap();
         assert_eq!(
             fs::metadata(copy.join("input"))
                 .unwrap()
@@ -843,22 +914,32 @@ mod tests {
             0
         );
         fs::set_permissions(copy.join("input"), fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(verify_unchanged(&source, &copy, &[]).is_err());
-        fs::write(copy.join("input"), b"other").unwrap();
+        assert!(verifier.verify_unchanged(&source, &copy, &[]).is_err());
+        // A same-length edit after the first two chunks must fail even with restored metadata.
+        *bytes.last_mut().unwrap() = 1;
+        fs::write(copy.join("input"), &bytes).unwrap();
+        File::open(copy.join("input"))
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(original.modified().unwrap()))
+            .unwrap();
         fs::set_permissions(
             copy.join("input"),
             fs::Permissions::from_mode(readonly_mode(&source.join("input")).unwrap()),
         )
         .unwrap();
-        assert!(verify_unchanged(&source, &copy, &[]).is_err());
+        let changed = fs::metadata(copy.join("input")).unwrap();
+        assert_eq!(changed.len(), original.len());
+        assert_eq!(changed.modified().unwrap(), original.modified().unwrap());
+        assert!(verifier.verify_unchanged(&source, &copy, &[]).is_err());
         fs::set_permissions(copy.join("input"), fs::Permissions::from_mode(0o644)).unwrap();
-        fs::write(copy.join("input"), b"input").unwrap();
+        *bytes.last_mut().unwrap() = 0;
+        fs::write(copy.join("input"), &bytes).unwrap();
         fs::set_permissions(
             copy.join("input"),
             fs::Permissions::from_mode(readonly_mode(&source.join("input")).unwrap()),
         )
         .unwrap();
-        verify_unchanged(&source, &copy, &[]).unwrap();
+        verifier.verify_unchanged(&source, &copy, &[]).unwrap();
         fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(copy.join("extra"), b"extra").unwrap();
         fs::set_permissions(
@@ -866,7 +947,7 @@ mod tests {
             fs::Permissions::from_mode(readonly_mode(&source).unwrap()),
         )
         .unwrap();
-        assert!(verify_unchanged(&source, &copy, &[]).is_err());
+        assert!(verifier.verify_unchanged(&source, &copy, &[]).is_err());
         fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

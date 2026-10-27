@@ -21,7 +21,7 @@ use harmonia_store_path::{StoreDir, StorePath, StorePathName};
 use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore};
 use harmonia_utils_hash::{Algorithm::SHA256, HashFormat};
 use serde::{Deserialize, Serialize};
-use source_wrap::same_contents;
+use source_wrap::{Verifier, same_contents};
 use std::borrow::Cow;
 use std::os::unix::fs as unix_fs;
 use std::{
@@ -783,8 +783,9 @@ impl Prepared {
         if directory.canonicalize()? != directory || !self.config.real_store.is_absolute() {
             bail!("snapshot ownership directory or physical store is not normalized");
         }
+        let mut verifier = Verifier::default();
         let (mut references, incremental_children, _leases) =
-            incremental::State::snapshot_references(self)?;
+            incremental::State::snapshot_references(self, &mut verifier)?;
         let mut owners = BTreeMap::new();
         // Overlapping transitive maps may repeat immutable paths. Cache only
         // exact backing paths for this snapshot, with files and trees separate.
@@ -832,7 +833,7 @@ impl Prepared {
                     if receipt.compiler_status.is_none() || key.canonicalize()? != **key {
                         bail!("snapshot artifact is incomplete or traverses symlinks");
                     }
-                    self.validate_receipt_contents(key, &receipt)?;
+                    self.validate_receipt_contents(key, &receipt, &mut verifier)?;
                     owners.insert((*key).clone(), receipt.files[*key].clone());
                 }
                 // Build scripts may remove their positive/negative probe files.
@@ -894,7 +895,7 @@ impl Prepared {
                 let old = self
                     .delivered(target)
                     .wrap_err("existing compiler output is not owned by dyndrv")?;
-                self.validate_receipt_contents(target, &old)?;
+                self.validate_receipt_contents(target, &old, &mut Verifier::default())?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -904,8 +905,13 @@ impl Prepared {
 
     // Callers validate receipt ownership and target regularity before comparing.
     // Reusing parsed metadata must still read the current mutable artifact bytes.
-    fn validate_receipt_contents(&self, target: &Path, receipt: &Delivered) -> eyre::Result<()> {
-        if !same_contents(target, &self.physical(&receipt.files[target])?)? {
+    fn validate_receipt_contents(
+        &self,
+        target: &Path,
+        receipt: &Delivered,
+        verifier: &mut Verifier,
+    ) -> eyre::Result<()> {
+        if !verifier.same_contents(target, &self.physical(&receipt.files[target])?)? {
             bail!("existing compiler output differs from its immutable receipt");
         }
         Ok(())
@@ -2052,19 +2058,16 @@ impl Prepared {
             products.report(&invocation.incremental.as_ref().unwrap().directory)?;
         }
         let source_verification_started = Instant::now();
+        let mut verifier = Verifier::default();
         for (destination, input) in &invocation.trees {
             if destination != input {
-                source_wrap::verify_unchanged(
-                    input,
-                    destination,
-                    &invocation.writable(destination),
-                )?;
+                verifier.verify_unchanged(input, destination, &invocation.writable(destination))?;
             }
         }
         let source_verification_seconds = source_verification_started.elapsed().as_secs_f64();
         let dependency_verification_started = Instant::now();
         for (target, input) in &invocation.dependencies {
-            if !same_contents(target, input)? {
+            if !verifier.same_contents(target, input)? {
                 bail!("compiler changed dependency input")
             }
         }
@@ -2716,15 +2719,16 @@ mod tests {
         );
         let archive = target.join("libleaf.rlib");
         let parsed = backend.delivered(&archive).unwrap();
+        let mut verifier = Verifier::default();
         backend
-            .validate_receipt_contents(&archive, &parsed)
+            .validate_receipt_contents(&archive, &parsed, &mut verifier)
             .unwrap();
         let mut bytes = fs::read(&archive).unwrap();
         bytes[0] ^= 1;
         fs::write(&archive, &bytes).unwrap();
         assert!(
             backend
-                .validate_receipt_contents(&archive, &parsed)
+                .validate_receipt_contents(&archive, &parsed, &mut verifier)
                 .is_err()
         );
         assert!(
