@@ -570,6 +570,7 @@ mod tests {
                 socket: PathBuf::new(),
                 real_store: root.join("store"),
                 store_mode: Default::default(),
+                artifact_delivery: Default::default(),
                 gc_roots: None,
                 source: root.join("source"),
                 package_sources: Vec::new(),

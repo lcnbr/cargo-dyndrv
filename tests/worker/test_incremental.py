@@ -159,7 +159,7 @@ class Qualification:
                 destination = (
                     self.state / "workspaces" / identity / policy / "stage/target"
                 )
-                shutil.copytree(target, destination)
+                shutil.copytree(target, destination, symlinks=True)
                 if strip:
                     shutil.rmtree(destination / "ci-optim/incremental")
                 module = b / "src/module0.rs"

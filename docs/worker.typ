@@ -38,6 +38,15 @@ The environment specification contains:
 - `inputs`: immutable compiler/native-tool store roots.
 - `nix`, `cargo`, `rustdoc`, `driver`, `nextest`, `python`: absolute executables.
 - `runtime_path`: executable search path for the Cargo session and source staging.
+- `artifact_delivery`: optional, defaults to `copy`. The experimental
+  `system-store-rlib-links` policy delivers successful `.rlib` outputs in ordinary
+  Cargo `deps` directories as exact links to rooted system-store files, provided
+  the same result supplies copied `.rmeta`. It requires the protected,
+  administrator-owned system store to be mounted read-only for the caller.
+  Private stores and unsupported store views are rejected. Other outputs remain
+  copies, including procedural macros: store timestamps make their `.so` files
+  stale against ordinary build-script outputs. The policy selects a separate
+  Cargo target without changing immutable compiler requests.
 - `source_overlay`: optional boolean, defaults to `false`. Set `true` to opt into
   the backend's source overlay materialization. This requires Linux overlayfs
   support inside the compiler's build namespace, including nested overlays when
@@ -142,6 +151,14 @@ Artifact snapshots reuse each parsed receipt and deduplicate exact immutable
 backing-path checks within that snapshot. Every mutable owned artifact still
 receives a full byte comparison, and incremental backing validation is unchanged.
 No receipt or artifact-validity cache persists across commands.
+With `system-store-rlib-links`, eligible owned links are checked for exact backing,
+representation and protected-store identity instead of rereading their payloads.
+Receipt completion, transitive owners and GC roots remain required. Replacing a
+recorded link with an equal-content copy is an error. Source, generated-directory,
+builder-dependency and incremental validation retain their existing checks.
+Generated inputs still reject symlinks; explicitly capturing a linked `deps`
+directory through a native library search path is outside this experimental
+policy. Backups of its target must preserve symlinks.
 
 Staged commands record `last-run.json` once their workspace target passes the
 interrupted-command check. Failures before this point, including initial metadata
@@ -180,13 +197,21 @@ python3 tests/worker/test_invalidation.py --bootstrap /absolute/bootstrap
 python3 tests/worker/test_macro_sources.py --bootstrap /absolute/bootstrap
 python3 tests/worker/test_incremental.py --bootstrap /absolute/bootstrap
 python3 tests/worker/test_system.py --bootstrap /absolute/bootstrap --second-user USER
+python3 tests/worker/test_artifact_links.py --bootstrap /absolute/rlib-link-bootstrap
 ```
 
 They cover source relocation, runtime identity and credentials, fresh test
 execution, concurrent clients, compiler failure/GC, SIGKILL recovery, source and
 session-tool invalidation, macro assets and incremental reuse/corruption. The
 system suite additionally needs the configured shared daemon and a second normal
-UID. Evidence directories retain logs and isolated fixtures for review; owned
+UID.
+
+The artifact-link suite requires the explicit `system-store-rlib-links` bootstrap
+and the configured system daemon. It covers Cargo freshness, repeated runtime
+tests, dependency edits, target restoration, link tampering and failure recovery;
+it never collects or stops the shared store.
+
+Evidence directories retain logs and isolated fixtures for review; owned
 private daemons stop on completion or failure. `workload.py` is a test fixture
 that constructs a small Cargo/Nextest workload, not application command dispatch.
 Applications can subclass the integration harness's invocation and fixture-copy

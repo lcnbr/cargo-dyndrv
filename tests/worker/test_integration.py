@@ -989,7 +989,13 @@ support = { path = "../crates/support" }
         }
         owners, metadata = set(), set()
         for record in records.values():
-            self.require(record["version"] == 5, "Unexpected target ownership format")
+            self.require(record["version"] == 6, "Unexpected target ownership format")
+            self.require(
+                isinstance(record["owned"], dict)
+                and record["owned"].keys() <= record["files"].keys()
+                and set(record["owned"].values()) <= {"copy", "store-link"},
+                "Unexpected target ownership representations",
+            )
             for backing in record["trees"].values():
                 match = re.match(r"/nix/store/[a-z0-9]{32}-[^/]+", backing)
                 self.require(match is not None, "Dependency source has no store owner")

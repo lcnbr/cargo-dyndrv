@@ -391,6 +391,11 @@ class Worker:
         if not isinstance(self.source_overlay, bool):
             # Bootstrap errors use the CLI's configuration diagnostic handler.
             raise ValueError("source_overlay must be a boolean")  # noqa: TRY004
+        self.artifact_delivery = self.spec.get("artifact_delivery", "copy")
+        if self.artifact_delivery not in ("copy", "system-store-rlib-links"):
+            raise ValueError(
+                "artifact_delivery must be copy or system-store-rlib-links"
+            )
         self.runtime_names = RUNTIME_NAMES | set(
             self.spec.get("runtime_environment_names", [])
         )
@@ -441,6 +446,25 @@ class Worker:
         )
         if mode not in {"private", "system"}:
             raise ValueError("CARGO_DYNDRV_STORE must be private or system")
+        if self.artifact_delivery == "system-store-rlib-links":
+            if mode != "system":
+                raise ValueError("system-store-rlib-links requires the system store")
+            for path in (Path("/nix"), Path("/nix/store")):
+                info = path.lstat()
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or path.resolve(strict=True) != path
+                    or info.st_uid != 0
+                    or os.access(path, os.W_OK, effective_ids=True)
+                ):
+                    raise ValueError(
+                        "system-store-rlib-links requires canonical, administrator-owned "
+                        f"store directories that are not writable by the caller: {path}"
+                    )
+            if not os.statvfs("/nix/store").f_flag & os.ST_RDONLY:
+                raise ValueError(
+                    "system-store-rlib-links requires a read-only /nix/store mount"
+                )
         self.daemon = Daemon(self.state, self.spec, mode=mode)
         if mode == "system":
             self.logical = Path(settings.get("logical_root", "/build/cargo-dyndrv"))
@@ -852,7 +876,7 @@ class Worker:
         # successful snapshot; Cargo may consider these partial products fresh.
         for path in (target / ".dyndrv-delivered").glob("*.json"):
             receipt = json.loads(path.read_text())
-            if receipt.get("version") != 5:
+            if receipt.get("version") != 6:
                 raise ValueError(f"Unsupported dyndrv artifact receipt: {path}")
             for backing in itertools.chain(
                 receipt["files"].values(), receipt["trees"].values()
@@ -1179,6 +1203,7 @@ class Worker:
                     "socket": str(self.daemon.socket),
                     "real_store": str(self.daemon.store_root),
                     "store_mode": self.daemon.mode,
+                    "artifact_delivery": self.artifact_delivery,
                     "source": layout["workspace"],
                     "source_overlay": self.source_overlay,
                     "target": str(self.logical / "target"),

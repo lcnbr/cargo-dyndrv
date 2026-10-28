@@ -6,6 +6,7 @@ import select
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import tomli_w
@@ -230,6 +232,241 @@ class WorkerPolicyTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError) as failure:
             runner.run_post_commands(Path("namespace.json"), layout)
         self.assertEqual(failure.exception.returncode, 17)
+
+
+class ArtifactDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="dyndrv-artifact-policy-")
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.state = self.directory / "state"
+        self.spec = {
+            "environment": {},
+            "runtime_path": "/tool/bin",
+            "nix": "/tool/bin/nix",
+            "cargo": "/tool/bin/cargo",
+            "driver": "/tool/bin/cargo-dyndrv",
+            "rustdoc": "/tool/bin/rustdoc",
+            "inputs": ["/nix/store/compiler-input"],
+        }
+        config = self.directory / "store.json"
+        worker.write_json(config, {"version": 1, "store_mode": "system"})
+        self.enterContext(
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CARGO_DYNDRV_STATE": str(self.state),
+                    "CARGO_DYNDRV_STORE_CONFIG": str(config),
+                    "CARGO_HOME": str(self.directory / "cargo-home"),
+                },
+                clear=True,
+            )
+        )
+        self.host = {
+            Path("/nix"): SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0),
+            Path("/nix/store"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o1775, st_uid=0, st_gid=30000
+            ),
+            Path("/build/cargo-dyndrv"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755, st_uid=0
+            ),
+        }
+        lstat = Path.lstat
+        self.enterContext(
+            mock.patch.object(
+                Path,
+                "lstat",
+                autospec=True,
+                side_effect=lambda path: (
+                    self.host[path] if path in self.host else lstat(path)
+                ),
+            )
+        )
+        resolve = Path.resolve
+        self.canonical = {path: path for path in self.host}
+        self.enterContext(
+            mock.patch.object(
+                Path,
+                "resolve",
+                autospec=True,
+                side_effect=lambda path, **options: (
+                    self.canonical[path]
+                    if path in self.canonical
+                    else resolve(path, **options)
+                ),
+            )
+        )
+        self.access = self.enterContext(
+            mock.patch.object(worker.os, "access", return_value=False)
+        )
+        self.mount = self.enterContext(
+            mock.patch.object(
+                worker.os,
+                "statvfs",
+                return_value=SimpleNamespace(f_flag=os.ST_RDONLY | os.ST_NOSUID),
+            )
+        )
+        self.daemon = self.enterContext(mock.patch.object(worker, "Daemon"))
+        self.private_directory = self.enterContext(
+            mock.patch.object(worker, "private_directory")
+        )
+
+    def make_worker(self):
+        worker.write_json(self.directory / "environment.json", self.spec)
+        return worker.Worker(self.directory, self.directory, "check", ["check"])
+
+    def test_copy_default_and_explicit_policy_skip_the_host_gate(self):
+        for mode in ("private", "system"):
+            for option in ({}, {"artifact_delivery": "copy"}):
+                with self.subTest(mode=mode, option=option):
+                    self.spec.pop("artifact_delivery", None)
+                    self.spec.update(option)
+                    with mock.patch.dict(os.environ, {"CARGO_DYNDRV_STORE": mode}):
+                        runner = self.make_worker()
+                    self.assertEqual(runner.artifact_delivery, "copy")
+        self.access.assert_not_called()
+        self.mount.assert_not_called()
+
+    def test_invalid_policy_is_rejected_before_store_configuration_or_state(self):
+        for value in (None, "system-store-links", "copy ", "", True, 0, [], {}):
+            with self.subTest(value=value):
+                self.spec["artifact_delivery"] = value
+                with (
+                    mock.patch.object(Path, "is_file") as store_configuration,
+                    self.assertRaisesRegex(ValueError, "artifact_delivery must be"),
+                ):
+                    self.make_worker()
+                store_configuration.assert_not_called()
+        self.daemon.assert_not_called()
+        self.private_directory.assert_not_called()
+        self.access.assert_not_called()
+        self.mount.assert_not_called()
+        self.assertFalse(self.state.exists())
+
+    def test_link_policy_refuses_private_store_before_daemon_or_state(self):
+        self.spec["artifact_delivery"] = "system-store-rlib-links"
+        with (
+            mock.patch.dict(os.environ, {"CARGO_DYNDRV_STORE": "private"}),
+            self.assertRaisesRegex(ValueError, "requires the system store"),
+        ):
+            self.make_worker()
+        self.daemon.assert_not_called()
+        self.private_directory.assert_not_called()
+        self.access.assert_not_called()
+        self.mount.assert_not_called()
+        self.assertFalse(self.state.exists())
+
+    def test_link_policy_accepts_protected_admin_group_writable_store(self):
+        self.spec["artifact_delivery"] = "system-store-rlib-links"
+        runner = self.make_worker()
+        self.assertEqual(runner.artifact_delivery, "system-store-rlib-links")
+        self.assertEqual(self.daemon.call_args.kwargs, {"mode": "system"})
+        self.assertEqual(
+            self.access.call_args_list,
+            [
+                mock.call(path, os.W_OK, effective_ids=True)
+                for path in (Path("/nix"), Path("/nix/store"))
+            ],
+        )
+        self.mount.assert_called_once_with("/nix/store")
+
+    def test_link_policy_refuses_untrusted_host_directories_before_state(self):
+        self.spec["artifact_delivery"] = "system-store-rlib-links"
+        for path in (Path("/nix"), Path("/nix/store")):
+            for change in (
+                {"st_uid": 1001},
+                {"st_uid": 65534},
+                {"st_mode": stat.S_IFLNK | 0o777},
+                {"st_mode": stat.S_IFREG | 0o555},
+            ):
+                with self.subTest(path=path, change=change):
+                    info = SimpleNamespace(**(vars(self.host[path]) | change))
+                    with (
+                        mock.patch.dict(self.host, {path: info}),
+                        self.assertRaisesRegex(ValueError, "administrator-owned"),
+                    ):
+                        self.make_worker()
+            with (
+                self.subTest(path=path, change="noncanonical"),
+                mock.patch.dict(self.canonical, {path: Path("/elsewhere")}),
+                self.assertRaisesRegex(ValueError, "canonical"),
+            ):
+                self.make_worker()
+            with self.subTest(path=path, change="writable"):
+                self.access.side_effect = (
+                    lambda candidate, *args, expected=path, **kwargs: (
+                        candidate == expected
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, "not writable by the caller"):
+                    self.make_worker()
+                self.access.side_effect = None
+        self.daemon.assert_not_called()
+        self.private_directory.assert_not_called()
+        self.assertFalse(self.state.exists())
+
+    def test_link_policy_requires_read_only_store_mount(self):
+        self.spec["artifact_delivery"] = "system-store-rlib-links"
+        self.mount.return_value.f_flag = 0
+        with self.assertRaisesRegex(ValueError, "read-only /nix/store mount"):
+            self.make_worker()
+        self.daemon.assert_not_called()
+        self.private_directory.assert_not_called()
+        self.assertFalse(self.state.exists())
+
+    def test_delivery_policy_separates_targets_without_changing_compiler_inputs(self):
+        daemon = self.daemon.return_value
+        daemon.mode = "system"
+        daemon.state = self.state
+        daemon.store_root = Path("/")
+        daemon.socket = Path("/nix/var/nix/daemon-socket/socket")
+        layout = {
+            "workspace": "/build/cargo-dyndrv/workspace",
+            "roots": [],
+            "package_sources": ["/build/cargo-dyndrv/workspace"],
+        }
+        deliveries = []
+        for policy in ("copy", "system-store-rlib-links", "copy"):
+            self.spec["artifact_delivery"] = policy
+            runner = self.make_worker()
+
+            def execute(
+                config, command, *, capture=False, policy=policy, runner=runner
+            ):
+                if command[1] == "metadata":
+                    return json.dumps({"packages": []})
+                if command[1] == "snapshot-references":
+                    worker.write_json(Path(command[-1]), {"storePaths": []})
+                else:
+                    self.assertEqual(command[1], "nix-cargo")
+                    backend = json.loads((config.parent / "backend.json").read_text())
+                    self.assertEqual(backend.pop("artifact_delivery"), policy)
+                    roots = Path(backend.pop("gc_roots"))
+                    self.assertEqual(roots.name, config.parent.name)
+                    namespace = json.loads(config.read_text())
+                    self.assertEqual(namespace["store"], "/nix/store")
+                    deliveries.append(
+                        (namespace["stage"], backend, runner.environment.copy())
+                    )
+
+            with (
+                mock.patch.object(
+                    runner,
+                    "original_metadata",
+                    return_value={"workspace_root": str(self.directory)},
+                ),
+                mock.patch.object(
+                    runner, "vendor_input", return_value=Path("/nix/store/vendor")
+                ),
+                mock.patch.object(runner, "vendor_layout", return_value=({}, [])),
+                mock.patch.object(worker, "SourceLayout") as sources,
+                mock.patch.object(runner, "run_namespace", side_effect=execute),
+            ):
+                sources.return_value.prepare.return_value = layout
+                self.assertEqual(runner.run(), 0)
+        self.assertNotEqual(deliveries[0][0], deliveries[1][0])
+        self.assertEqual(deliveries[0][1:], deliveries[1][1:])
+        self.assertEqual(deliveries[0], deliveries[2])
 
 
 class VendorInputTests(unittest.TestCase):
@@ -631,7 +868,8 @@ class WorkerLifecycleTests(unittest.TestCase):
         worker.write_json(
             target / ".dyndrv-delivered/dependency.json",
             {
-                "version": 5,
+                "version": 6,
+                "owned": {"artifact": "store-link"},
                 "files": {"artifact": artifact},
                 "trees": {"source": source},
             },
@@ -644,17 +882,43 @@ class WorkerLifecycleTests(unittest.TestCase):
             session / "completed.nix-result.json",
             {"compilerSucceeded": True, "output": "/nix/store/completed-owner"},
         )
-        with mock.patch.object(self.daemon, "retain") as retain:
-            runner.retain_failed(session, target, "workspace/policy")
-        retain.assert_called_once_with(
+        for representation in ("copy", "store-link"):
+            with self.subTest(representation=representation):
+                path = target / ".dyndrv-delivered/dependency.json"
+                receipt = json.loads(path.read_text())
+                receipt["owned"]["artifact"] = representation
+                worker.write_json(path, receipt)
+                with mock.patch.object(self.daemon, "retain") as retain:
+                    runner.retain_failed(session, target, "workspace/policy")
+                retain.assert_called_once_with(
+                    {
+                        "/nix/store/artifact-owner",
+                        source,
+                        incremental,
+                        "/nix/store/completed-owner",
+                    },
+                    "workspace/policy",
+                )
+
+    def test_failed_build_rejects_old_artifact_schema_before_retaining_roots(self):
+        runner = worker.Worker.__new__(worker.Worker)
+        runner.daemon = self.daemon
+        target = self.directory / "target"
+        worker.write_json(
+            target / ".dyndrv-delivered/dependency.json",
             {
-                "/nix/store/artifact-owner",
-                source,
-                incremental,
-                "/nix/store/completed-owner",
+                "version": 5,
+                "owned": ["artifact"],
+                "files": {"artifact": "/nix/store/artifact-owner/artifact"},
+                "trees": {},
             },
-            "workspace/policy",
         )
+        with (
+            mock.patch.object(self.daemon, "retain") as retain,
+            self.assertRaisesRegex(ValueError, "Unsupported dyndrv artifact receipt"),
+        ):
+            runner.retain_failed(self.directory / "session", target, "workspace/policy")
+        retain.assert_not_called()
 
     def test_failed_build_rejects_dependency_source_outside_store(self):
         runner = worker.Worker.__new__(worker.Worker)
@@ -662,7 +926,12 @@ class WorkerLifecycleTests(unittest.TestCase):
         target = self.directory / "target"
         worker.write_json(
             target / ".dyndrv-delivered/dependency.json",
-            {"version": 5, "files": {}, "trees": {"source": "/tmp/mutable-source"}},
+            {
+                "version": 6,
+                "owned": {},
+                "files": {},
+                "trees": {"source": "/tmp/mutable-source"},
+            },
         )
         with (
             mock.patch.object(self.daemon, "retain") as retain,

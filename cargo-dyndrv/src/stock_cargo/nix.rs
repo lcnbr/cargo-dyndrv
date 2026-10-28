@@ -20,10 +20,17 @@ use harmonia_store_derivation::{
 use harmonia_store_path::{StoreDir, StorePath, StorePathName};
 use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore};
 use harmonia_utils_hash::{Algorithm::SHA256, HashFormat};
+use libc::{AT_EACCESS, AT_FDCWD, EACCES, EROFS, ST_RDONLY, W_OK};
 use serde::{Deserialize, Serialize};
 use source_wrap::{Verifier, same_contents};
 use std::borrow::Cow;
+use std::ffi::CString;
+use std::fs::{File, Metadata, Permissions};
+use std::io;
+use std::io::Error as IoError;
+use std::mem::MaybeUninit;
 use std::os::unix::fs as unix_fs;
+use std::process;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
@@ -48,6 +55,81 @@ enum StoreMode {
     System,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ArtifactDelivery {
+    #[default]
+    Copy,
+    SystemStoreRlibLinks,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum Representation {
+    Copy,
+    StoreLink,
+}
+
+impl Representation {
+    // The caller separately authenticates ownership and immutable store backing.
+    // This check never treats an equal-content replacement as the recorded link.
+    fn validate_contents(
+        self,
+        target: &Path,
+        input: &Path,
+        verifier: &mut Verifier,
+    ) -> eyre::Result<()> {
+        let info = target.symlink_metadata()?;
+        match self {
+            Self::Copy => {
+                if !info.is_file() || !verifier.same_contents(target, input)? {
+                    bail!("existing compiler output differs from its immutable receipt");
+                }
+            }
+            Self::StoreLink => {
+                if !info.file_type().is_symlink()
+                    || fs::read_link(target)?.as_os_str() != input.as_os_str()
+                    || !input.symlink_metadata()?.is_file()
+                {
+                    bail!("existing compiler output differs from its exact store link");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn publish(self, input: &Path, target: &Path, owner: &Path) -> eyre::Result<()> {
+        let temporary = target.with_extension(format!("dyndrv-{}.tmp", process::id()));
+        let staged = match self {
+            Self::Copy => Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?,
+            ),
+            Self::StoreLink => {
+                unix_fs::symlink(owner, &temporary)?;
+                None
+            }
+        };
+        let result = (|| -> eyre::Result<()> {
+            if let Some(mut staged) = staged {
+                io::copy(&mut File::open(input)?, &mut staged)?;
+                staged.set_permissions(Permissions::from_mode(
+                    input.metadata()?.permissions().mode() | 0o200,
+                ))?;
+            }
+            fs::rename(&temporary, target)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Exclusive creation above succeeded: only our staging node is ours.
+            let _ = fs::remove_file(temporary);
+        }
+        result
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -58,6 +140,9 @@ struct Config {
     real_store: PathBuf,
     #[serde(default)]
     store_mode: StoreMode,
+    // Delivery is a client policy, never part of the immutable compiler request.
+    #[serde(default)]
+    artifact_delivery: ArtifactDelivery,
     #[serde(default)]
     gc_roots: Option<PathBuf>,
     source: PathBuf,
@@ -126,21 +211,74 @@ struct Delivered {
     // Early metadata has no exit status. A completed negative compiler probe
     // still owns its dep-info/objects, but cannot supply a completed link input.
     compiler_status: Option<i32>,
-    owned: BTreeSet<PathBuf>,
+    owned: BTreeMap<PathBuf, Representation>,
     files: BTreeMap<PathBuf, PathBuf>,
     // Complete source images needed when a downstream compiler expands macros.
     trees: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl Delivered {
-    fn validate(&self, path: &Path) -> eyre::Result<()> {
-        if self.version != 5
-            || !self.owned.contains(path)
-            || !self.owned.iter().all(|path| self.files.contains_key(path))
+    fn select_representations(&mut self, config: &Config, output: &CompilerOutput) {
+        if config.artifact_delivery == ArtifactDelivery::SystemStoreRlibLinks
+            && matches!(config.store_mode, StoreMode::System)
+            && self.compiler_status == Some(0)
+            && matches!(output, CompilerOutput::Directory(_))
+        {
+            // Keep selection separate from mutation: sibling metadata must be
+            // owned Copy in this completed result, not a transitive input.
+            let links: Vec<_> = self
+                .owned
+                .keys()
+                .filter(|path| {
+                    path.parent() == output.directory()
+                        && self.rlib_link_eligible(path, &config.target)
+                })
+                .cloned()
+                .collect();
+            for path in links {
+                self.owned.insert(path, Representation::StoreLink);
+            }
+        }
+    }
+
+    fn validate(&self, path: &Path, config: &Config) -> eyre::Result<()> {
+        if self.version != 6
+            || !self.owned.contains_key(path)
+            || !self.owned.keys().all(|path| self.files.contains_key(path))
         {
             bail!("artifact receipt version or ownership mismatch");
         }
+        for (target, representation) in &self.owned {
+            if *representation == Representation::StoreLink
+                && (config.artifact_delivery != ArtifactDelivery::SystemStoreRlibLinks
+                    || !matches!(config.store_mode, StoreMode::System)
+                    || self.compiler_status != Some(0)
+                    || !self.rlib_link_eligible(target, &config.target))
+            {
+                bail!("artifact receipt claims an ineligible store link");
+            }
+        }
         Ok(())
+    }
+
+    fn rlib_link_eligible(&self, path: &Path, target: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(target) else {
+            return false;
+        };
+        let components: Vec<_> = relative.components().collect();
+        let ordinary = matches!(components.as_slice(),
+            [Component::Normal(_), Component::Normal(deps), Component::Normal(_)]
+                | [Component::Normal(_), Component::Normal(_), Component::Normal(deps), Component::Normal(_)]
+                if *deps == OsStr::new("deps"));
+        ordinary
+            && path.components().collect::<PathBuf>().as_os_str() == path.as_os_str()
+            && path.extension() == Some(OsStr::new("rlib"))
+            && self.owned.get(&path.with_extension("rmeta")) == Some(&Representation::Copy)
+            && self.files.contains_key(&path.with_extension("rmeta"))
+            && !self
+                .trees
+                .keys()
+                .any(|root| root.starts_with(target) && path.starts_with(root))
     }
 }
 
@@ -349,7 +487,12 @@ impl Invocation {
 impl Prepared {
     fn configured_socket(config: &Config) -> eyre::Result<PathBuf> {
         match config.store_mode {
-            StoreMode::Private => bound_graph::socket(&config.socket),
+            StoreMode::Private => {
+                if config.artifact_delivery != ArtifactDelivery::Copy {
+                    bail!("store-link delivery requires the administered system store");
+                }
+                bound_graph::socket(&config.socket)
+            }
             StoreMode::System => {
                 let path = config.socket.canonicalize()?;
                 let info = config.socket.symlink_metadata()?;
@@ -373,9 +516,92 @@ impl Prepared {
                         "system mode requires the administrator-owned system daemon and durable GC roots"
                     );
                 }
+                if config.artifact_delivery == ArtifactDelivery::SystemStoreRlibLinks {
+                    if config.socket.as_os_str() != path.as_os_str() {
+                        bail!("store-link daemon socket must have its canonical spelling");
+                    }
+                    for ancestor in path.ancestors().skip(1) {
+                        if !Self::protected_store_entry(ancestor, info.uid())?.is_dir() {
+                            bail!("system daemon ancestor is not a real directory");
+                        }
+                    }
+                    for ancestor in Path::new("/nix/store").ancestors() {
+                        if !Self::protected_store_entry(ancestor, info.uid())?.is_dir() {
+                            bail!("system store ancestor is not a real directory");
+                        }
+                    }
+                    Self::readonly_store_mount(Path::new("/nix/store"))?;
+                }
                 Ok(path)
             }
         }
+    }
+
+    // std has no effective-access or mount-flags query. These small FFI calls
+    // check the live administered namespace, never a serialized trust flag.
+    fn protected_store_entry(path: &Path, admin: u32) -> eyre::Result<Metadata> {
+        let info = path.symlink_metadata()?;
+        if info.file_type().is_symlink() || info.uid() != admin {
+            bail!(
+                "system store path is not owned by its administrator: {}",
+                path.display()
+            );
+        }
+        let name = CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: name is a live NUL-terminated string; faccessat only queries
+        // the named path and AT_EACCESS selects the caller's effective IDs.
+        if unsafe { libc::faccessat(AT_FDCWD, name.as_ptr(), W_OK, AT_EACCESS) } == 0 {
+            bail!(
+                "system store path is writable by the caller: {}",
+                path.display()
+            );
+        }
+        let error = IoError::last_os_error();
+        if !matches!(error.raw_os_error(), Some(EACCES | EROFS)) {
+            return Err(error.into());
+        }
+        Ok(info)
+    }
+
+    fn readonly_store_mount(path: &Path) -> eyre::Result<()> {
+        let name = CString::new(path.as_os_str().as_bytes())?;
+        let mut stats = MaybeUninit::uninit();
+        // SAFETY: name remains NUL-terminated and live; stats is correctly
+        // aligned writable storage. statvfs initializes it on success only.
+        if unsafe { libc::statvfs(name.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return Err(IoError::last_os_error().into());
+        }
+        // SAFETY: the successful statvfs call initialized all fields above.
+        if unsafe { stats.assume_init() }.f_flag & ST_RDONLY == 0 {
+            bail!("store-link delivery requires a read-only system store mount");
+        }
+        Ok(())
+    }
+
+    fn validate_store_backing(&self, input: &Path) -> eyre::Result<()> {
+        let physical = self.physical(input)?;
+        if self.config.artifact_delivery != ArtifactDelivery::SystemStoreRlibLinks
+            || physical.as_os_str() != input.as_os_str()
+            || input.components().collect::<PathBuf>().as_os_str() != input.as_os_str()
+        {
+            bail!("store-link backing requires a normalized system store path");
+        }
+        let socket = Self::configured_socket(&self.config)?;
+        let admin = socket.symlink_metadata()?.uid();
+        let store = Path::new("/nix/store");
+        let device = store.symlink_metadata()?.dev();
+        for path in input.ancestors().take_while(|path| *path != store) {
+            let info = Self::protected_store_entry(path, admin)?;
+            if info.dev() != device
+                || info.mode() & 0o222 != 0
+                || (path == input && !info.is_file())
+                || (path != input && !info.is_dir())
+            {
+                bail!("store-link backing is not a protected immutable regular file");
+            }
+            Self::readonly_store_mount(path)?;
+        }
+        Ok(())
     }
 
     async fn pin<T: DaemonStore>(&self, daemon: &mut T, input: &Path) -> eyre::Result<()> {
@@ -768,16 +994,23 @@ impl Prepared {
 
     fn delivered(&self, path: &Path) -> eyre::Result<Delivered> {
         let file = self.receipt(path);
+        let directory = file.parent().expect("receipt has an ownership directory");
+        if directory.canonicalize()?.as_os_str() != directory.as_os_str() {
+            bail!("artifact ownership directory must not traverse symlinks");
+        }
         if !file.symlink_metadata()?.is_file() {
             bail!("artifact receipt must be a regular file");
         }
         let receipt: Delivered = serde_json::from_slice(&fs::read(file)?)?;
-        receipt.validate(path)?;
+        receipt.validate(path, &self.config)?;
         Ok(receipt)
     }
 
     pub(super) fn snapshot_references(&self) -> eyre::Result<SnapshotReferences> {
         let started = Instant::now();
+        if self.config.artifact_delivery == ArtifactDelivery::SystemStoreRlibLinks {
+            Self::configured_socket(&self.config)?;
+        }
         Self::scratch(&self.config.target)?;
         let directory = self.config.target.join(".dyndrv-delivered");
         if directory.canonicalize()? != directory || !self.config.real_store.is_absolute() {
@@ -804,13 +1037,13 @@ impl Prepared {
             let receipt: Delivered = serde_json::from_slice(&fs::read(&path)?)?;
             let keys: Vec<_> = receipt
                 .owned
-                .iter()
+                .keys()
                 .filter(|p| self.receipt(p) == path)
                 .collect();
             let [key] = keys.as_slice() else {
                 bail!("artifact receipt filename does not identify one owned file");
             };
-            receipt.validate(key)?;
+            receipt.validate(key, &self.config)?;
             for input in receipt.trees.values() {
                 if !validated_trees.contains(input) {
                     if !self.physical(input)?.is_dir() {
@@ -821,42 +1054,45 @@ impl Prepared {
                     validated_trees.insert(input.clone());
                 }
             }
-            Self::scratch(key)?;
-            if !key.starts_with(&self.config.target) {
-                bail!("snapshot artifact escapes target");
-            }
+            self.validate_target_parent(key)?;
             match key.symlink_metadata() {
-                Ok(info) => {
-                    if !info.is_file() {
-                        bail!("existing compiler output is not a regular file");
+                Ok(_) => {
+                    if receipt.compiler_status.is_none() {
+                        bail!("snapshot artifact is incomplete");
                     }
-                    if receipt.compiler_status.is_none() || key.canonicalize()? != **key {
-                        bail!("snapshot artifact is incomplete or traverses symlinks");
-                    }
-                    self.validate_receipt_contents(key, &receipt, &mut verifier)?;
+                    self.validate_receipt_contents(
+                        key,
+                        &receipt,
+                        &receipt.files[*key],
+                        &mut verifier,
+                    )?;
                     owners.insert((*key).clone(), receipt.files[*key].clone());
                 }
                 // Build scripts may remove their positive/negative probe files.
                 // Keep the immutable references named by those retained receipts,
                 // without restoring deleted files or asserting they still exist.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if receipt.owned[*key] == Representation::StoreLink {
+                        self.validate_store_backing(&receipt.files[*key])?;
+                    }
+                }
                 Err(error) => return Err(error.into()),
             }
             // Transitive mappings may describe earlier compiler inputs. Retain
             // those immutable references without pretending they all describe
             // the current mutable target. Each current key is checked above.
-            for (target, input) in receipt.files {
-                Self::scratch(&target)?;
+            for (target, input) in &receipt.files {
+                Self::scratch(target)?;
                 if !target.starts_with(&self.config.target) {
                     bail!("snapshot dependency is outside target or lacks immutable backing");
                 }
-                if !validated_files.contains(&input) {
-                    if !self.physical(&input)?.symlink_metadata()?.is_file() {
+                if !validated_files.contains(input) {
+                    if !self.physical(input)?.symlink_metadata()?.is_file() {
                         bail!("snapshot dependency is outside target or lacks immutable backing");
                     }
                     references
-                        .insert(Self::store_path(&input)?.to_absolute_path(&StoreDir::default()));
-                    validated_files.insert(input);
+                        .insert(Self::store_path(input)?.to_absolute_path(&StoreDir::default()));
+                    validated_files.insert(input.clone());
                 }
             }
         }
@@ -877,7 +1113,7 @@ impl Prepared {
         let receipt = self.delivered(artifact)?;
         Ok(receipt
             .owned
-            .into_iter()
+            .into_keys()
             .filter(|path| path.as_os_str().as_bytes().ends_with(b".rcgu.o"))
             .map(|path| {
                 let owner = receipt.files[&path].clone();
@@ -887,15 +1123,18 @@ impl Prepared {
     }
 
     fn validate_replacement(&self, target: &Path) -> eyre::Result<()> {
+        self.validate_target_parent(target)?;
         match target.symlink_metadata() {
-            Ok(info) => {
-                if !info.is_file() {
-                    bail!("existing compiler output is not a regular file")
-                }
+            Ok(_) => {
                 let old = self
                     .delivered(target)
                     .wrap_err("existing compiler output is not owned by dyndrv")?;
-                self.validate_receipt_contents(target, &old, &mut Verifier::default())?;
+                self.validate_receipt_contents(
+                    target,
+                    &old,
+                    &old.files[target],
+                    &mut Verifier::default(),
+                )?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -903,18 +1142,49 @@ impl Prepared {
         Ok(())
     }
 
-    // Callers validate receipt ownership and target regularity before comparing.
-    // Reusing parsed metadata must still read the current mutable artifact bytes.
+    fn validate_target_parent(&self, target: &Path) -> eyre::Result<()> {
+        Self::scratch(target)?;
+        let parent = target
+            .parent()
+            .ok_or_else(|| eyre::eyre!("artifact has no parent"))?;
+        if !target.starts_with(&self.config.target)
+            || target == self.config.target
+            || target.components().collect::<PathBuf>().as_os_str() != target.as_os_str()
+        {
+            bail!("artifact must have a normalized target path and real parent directories");
+        }
+        // Build scripts may remove entire probe directories. Inspect every
+        // remaining ancestor so a dangling directory link cannot hide a leaf.
+        for ancestor in parent.ancestors() {
+            match ancestor.symlink_metadata() {
+                Ok(info) if info.is_dir() => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Ok(_) => bail!("artifact parent is not a real directory"),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    // Reusing parsed metadata still validates the current node. Only a recorded,
+    // exact store link with live immutable backing can omit the byte comparison.
     fn validate_receipt_contents(
         &self,
         target: &Path,
         receipt: &Delivered,
+        input: &Path,
         verifier: &mut Verifier,
     ) -> eyre::Result<()> {
-        if !verifier.same_contents(target, &self.physical(&receipt.files[target])?)? {
-            bail!("existing compiler output differs from its immutable receipt");
+        receipt.validate(target, &self.config)?;
+        self.validate_target_parent(target)?;
+        let representation = receipt.owned[target];
+        if representation == Representation::StoreLink {
+            if receipt.files[target].as_os_str() != input.as_os_str() {
+                bail!("current artifact receipt differs from merged dependency owner");
+            }
+            self.validate_store_backing(input)?;
         }
-        Ok(())
+        representation.validate_contents(target, &self.physical(input)?, verifier)
     }
 
     fn publish_receipt(&self, target: &Path, delivered: &Delivered) -> eyre::Result<()> {
@@ -958,9 +1228,9 @@ impl Prepared {
             self.publish_receipt(
                 target,
                 &Delivered {
-                    version: 5,
+                    version: 6,
                     compiler_status: None,
-                    owned: BTreeSet::from([target.clone()]),
+                    owned: BTreeMap::from([(target.clone(), Representation::Copy)]),
                     files,
                     trees: invocation.trees.clone(),
                 },
@@ -1057,10 +1327,27 @@ impl Prepared {
         // Direct dependencies carry overlapping transitive receipts. Merge and
         // reject conflicting owners before reading each distinct artifact once.
         for (target, immutable) in &dependencies {
-            if !target.starts_with(&self.config.target)
-                || !same_contents(target, &self.physical(immutable)?)?
-            {
+            if !target.starts_with(&self.config.target) {
                 bail!("delivered dependency differs from immutable input");
+            }
+            match self.receipt(target).symlink_metadata() {
+                Ok(_) => {
+                    let receipt = self.delivered(target)?;
+                    self.validate_receipt_contents(
+                        target,
+                        &receipt,
+                        immutable,
+                        &mut Verifier::default(),
+                    )?;
+                }
+                // Transitive-only files and Cargo aliases have no current
+                // ownership claim. They still require complete byte equality.
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    if !same_contents(target, &self.physical(immutable)?)? {
+                        bail!("delivered dependency differs from immutable input");
+                    }
+                }
+                Err(error) => return Err(error.into()),
             }
         }
         trees.extend(source_trees);
@@ -1781,13 +2068,31 @@ impl Prepared {
                 stale_objects.push(target);
             }
         }
-        let delivered = Delivered {
-            version: 5,
+        let mut delivered = Delivered {
+            version: 6,
             compiler_status: Some(raw_status),
-            owned: owned_paths,
+            owned: owned_paths
+                .into_iter()
+                .map(|path| (path, Representation::Copy))
+                .collect(),
             files,
             trees: invocation.trees.clone(),
         };
+        delivered.select_representations(&self.config, &invocation.output);
+        if delivered
+            .owned
+            .values()
+            .any(|value| *value == Representation::StoreLink)
+        {
+            // Result out-links already retain this package; also use the normal
+            // durable pin lifecycle before exposing any backing through a link.
+            self.pin(&mut daemon, &output).await?;
+            for (target, representation) in &delivered.owned {
+                if *representation == Representation::StoreLink {
+                    self.validate_store_backing(&delivered.files[target])?;
+                }
+            }
+        }
         for (input, target) in &owned {
             if target.extension() == Some(OsStr::new("rmeta"))
                 && target.try_exists()?
@@ -1797,17 +2102,7 @@ impl Prepared {
                 // identical bytes would change mtime and dirty those consumers.
                 continue;
             }
-            let temporary = target.with_extension(format!("dyndrv-{}.tmp", std::process::id()));
-            let mut staged = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            std::io::copy(&mut fs::File::open(input)?, &mut staged)?;
-            staged.set_permissions(fs::Permissions::from_mode(
-                input.metadata()?.permissions().mode() | 0o200,
-            ))?;
-            drop(staged);
-            fs::rename(&temporary, target)?;
+            delivered.owned[target].publish(input, target, &delivered.files[target])?;
         }
         for target in stale_objects {
             match fs::remove_file(&target) {
@@ -2132,6 +2427,397 @@ mod tests {
     use std::env;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct ArtifactFixture {
+        root: PathBuf,
+        prepared: Prepared,
+    }
+
+    impl ArtifactFixture {
+        fn new() -> Self {
+            let root = env::temp_dir().join(format!(
+                "dyndrv-artifacts-{}-{}",
+                process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let target = root.join("target");
+            fs::create_dir_all(target.join(".dyndrv-delivered")).unwrap();
+            let config = serde_json::from_value(serde_json::json!({
+                "nix": "", "socket": "", "real_store": root.join("store"),
+                "source": root.join("source"), "target": target,
+                "inputs": [], "environment_names": [], "omitted_environment_names": []
+            }))
+            .unwrap();
+            Self {
+                root,
+                prepared: Prepared {
+                    config,
+                    trees: BTreeMap::new(),
+                    builder_store: PathBuf::new(),
+                },
+            }
+        }
+
+        fn receipt(&self, directory: &str) -> Delivered {
+            let mut receipt = Delivered {
+                version: 6,
+                compiler_status: Some(0),
+                owned: BTreeMap::new(),
+                files: BTreeMap::new(),
+                trees: BTreeMap::new(),
+            };
+            for name in [
+                "libfixture.rlib",
+                "libfixture.rmeta",
+                "libfixture.so",
+                "fixture.d",
+                "fixture",
+                "fixture.rcgu.o",
+            ] {
+                let target = self.prepared.config.target.join(directory).join(name);
+                let input =
+                    Path::new("/nix/store/00000000000000000000000000000000-fixture").join(name);
+                let physical = self.prepared.physical(&input).unwrap();
+                fs::create_dir_all(physical.parent().unwrap()).unwrap();
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::write(&physical, name).unwrap();
+                fs::write(&target, name).unwrap();
+                receipt.owned.insert(target.clone(), Representation::Copy);
+                receipt.files.insert(target, input);
+            }
+            receipt
+        }
+    }
+
+    impl Drop for ArtifactFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn artifact_delivery_defaults_and_receipts_have_explicit_representations() {
+        let mut fixture = ArtifactFixture::new();
+        let config = &mut fixture.prepared.config;
+        assert_eq!(config.artifact_delivery, ArtifactDelivery::Copy);
+        let mut encoded = serde_json::to_value(&*config).unwrap();
+        assert_eq!(encoded["artifact_delivery"], "copy");
+        encoded["artifact_delivery"] = "system-store-links".into();
+        assert!(serde_json::from_value::<Config>(encoded).is_err());
+        config.artifact_delivery = ArtifactDelivery::SystemStoreRlibLinks;
+        assert!(Prepared::configured_socket(config).is_err());
+        // Snapshot reload must rerun the live gate even with no owned links.
+        assert!(fixture.prepared.snapshot_references().is_err());
+        fixture.prepared.config.store_mode = StoreMode::System;
+        let mut receipt = fixture.receipt("debug/deps");
+        let target = fixture
+            .prepared
+            .config
+            .target
+            .join("debug/deps/libfixture.rlib");
+        receipt
+            .owned
+            .insert(target.clone(), Representation::StoreLink);
+        receipt.validate(&target, &fixture.prepared.config).unwrap();
+        let encoded = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(encoded["version"], 6);
+        assert_eq!(encoded["owned"][target.to_str().unwrap()], "store-link");
+        assert_eq!(
+            encoded["owned"][target.with_extension("rmeta").to_str().unwrap()],
+            "copy"
+        );
+        let mut invalid = encoded;
+        invalid["owned"][target.to_str().unwrap()] = "symlink".into();
+        assert!(serde_json::from_value::<Delivered>(invalid).is_err());
+        for status in [None, Some(1 << 8)] {
+            receipt.compiler_status = status;
+            assert!(receipt.validate(&target, &fixture.prepared.config).is_err());
+        }
+        receipt.compiler_status = Some(0);
+        receipt.version = 5;
+        assert!(receipt.validate(&target, &fixture.prepared.config).is_err());
+        receipt.version = 6;
+        assert!(
+            receipt
+                .validate(&target.with_extension("unknown"), &fixture.prepared.config)
+                .is_err()
+        );
+        receipt.files.remove(&target.with_extension("rmeta"));
+        assert!(receipt.validate(&target, &fixture.prepared.config).is_err());
+    }
+
+    #[test]
+    fn store_link_selection_requires_completed_ordinary_rlib_and_owned_copied_metadata() {
+        let mut fixture = ArtifactFixture::new();
+        fixture.prepared.config.artifact_delivery = ArtifactDelivery::SystemStoreRlibLinks;
+        fixture.prepared.config.store_mode = StoreMode::System;
+        for directory in [
+            "debug/deps",
+            "x86_64-unknown-linux-gnu/release/deps",
+            "deps",
+            "debug/build/probe/out",
+            "nested/target/debug/deps",
+        ] {
+            let mut receipt = fixture.receipt(directory);
+            let output = CompilerOutput::Directory(fixture.prepared.config.target.join(directory));
+            receipt.select_representations(&fixture.prepared.config, &output);
+            let eligible = matches!(
+                directory,
+                "debug/deps" | "x86_64-unknown-linux-gnu/release/deps"
+            );
+            for (path, representation) in &receipt.owned {
+                assert_eq!(
+                    *representation == Representation::StoreLink,
+                    eligible && path.extension() == Some(OsStr::new("rlib")),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+        let directory = fixture.prepared.config.target.join("debug/deps");
+        let target = directory.join("libfixture.rlib");
+        for output in [CompilerOutput::File(target.clone()), CompilerOutput::Stdout] {
+            let mut receipt = fixture.receipt("debug/deps");
+            receipt.select_representations(&fixture.prepared.config, &output);
+            assert_eq!(receipt.owned[&target], Representation::Copy);
+        }
+        let output = CompilerOutput::Directory(directory.clone());
+        for status in [None, Some(1 << 8)] {
+            let mut receipt = fixture.receipt("debug/deps");
+            receipt.compiler_status = status;
+            receipt.select_representations(&fixture.prepared.config, &output);
+            assert_eq!(receipt.owned[&target], Representation::Copy);
+        }
+        let mut receipt = fixture.receipt("debug/deps");
+        receipt.owned.remove(&target.with_extension("rmeta"));
+        receipt.select_representations(&fixture.prepared.config, &output);
+        assert_eq!(
+            receipt.owned[&target],
+            Representation::Copy,
+            "transitive metadata is not an owned companion"
+        );
+        let mut receipt = fixture.receipt("debug/deps");
+        receipt
+            .trees
+            .insert(directory, PathBuf::from("generated-owner"));
+        receipt.select_representations(&fixture.prepared.config, &output);
+        assert_eq!(receipt.owned[&target], Representation::Copy);
+        let mut receipt = fixture.receipt("debug/deps");
+        fixture.prepared.config.artifact_delivery = ArtifactDelivery::Copy;
+        receipt.select_representations(&fixture.prepared.config, &output);
+        assert_eq!(receipt.owned[&target], Representation::Copy);
+    }
+
+    #[test]
+    fn exact_link_identity_and_atomic_staging_reject_substitutions() {
+        let fixture = ArtifactFixture::new();
+        let receipt = fixture.receipt("debug/deps");
+        let target = fixture
+            .prepared
+            .config
+            .target
+            .join("debug/deps/libfixture.rlib");
+        let input = fixture.prepared.physical(&receipt.files[&target]).unwrap();
+        let original = input.metadata().unwrap();
+        let validate = || {
+            Representation::StoreLink.validate_contents(&target, &input, &mut Verifier::default())
+        };
+        assert!(
+            validate().is_err(),
+            "equal regular bytes must not authenticate a link"
+        );
+        Representation::StoreLink
+            .publish(&input, &target, &input)
+            .unwrap();
+        validate().unwrap();
+        assert_eq!(
+            fs::read_link(&target).unwrap().as_os_str(),
+            input.as_os_str()
+        );
+        let other = input.with_extension("other");
+        fs::copy(&input, &other).unwrap();
+        for spelling in [
+            other,
+            input.parent().unwrap().join("./libfixture.rlib"),
+            PathBuf::from("libfixture.rlib"),
+            input.with_extension("missing"),
+        ] {
+            fs::remove_file(&target).unwrap();
+            unix_fs::symlink(&spelling, &target).unwrap();
+            assert!(validate().is_err(), "{}", spelling.display());
+        }
+        Representation::StoreLink
+            .publish(&input, &target, &input)
+            .unwrap();
+        validate().unwrap();
+        assert!(
+            Representation::Copy
+                .validate_contents(&target, &input, &mut Verifier::default())
+                .is_err()
+        );
+        let temporary = target.with_extension(format!("dyndrv-{}.tmp", process::id()));
+        fs::write(&temporary, "other operation").unwrap();
+        assert!(
+            Representation::StoreLink
+                .publish(&input, &target, &input)
+                .is_err()
+        );
+        assert_eq!(fs::read(&temporary).unwrap(), b"other operation");
+        fs::remove_file(&temporary).unwrap();
+        fs::remove_file(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+        assert!(
+            Representation::StoreLink
+                .publish(&input, &target, &input)
+                .is_err()
+        );
+        assert!(temporary.symlink_metadata().is_err());
+        assert_eq!(input.metadata().unwrap().mtime(), original.mtime());
+        assert_eq!(input.metadata().unwrap().mode(), original.mode());
+        fs::remove_dir(&target).unwrap();
+        unix_fs::symlink(&input, &target).unwrap();
+        fs::remove_file(&input).unwrap();
+        assert!(validate().is_err(), "dangling expected backing must fail");
+        // Structural fixtures do not certify /tmp as an administered store.
+        assert!(
+            fixture
+                .prepared
+                .validate_store_backing(&receipt.files[&target])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn copied_dependencies_keep_full_merged_byte_checks_across_owner_changes() {
+        let mut fixture = ArtifactFixture::new();
+        let original = fixture.receipt("debug/deps");
+        let directory = fixture.prepared.config.target.join("debug/deps");
+        let archive = directory.join("libfixture.rlib");
+        let direct = directory.join("libfixture.so");
+        fixture
+            .prepared
+            .publish_receipt(&direct, &original)
+            .unwrap();
+        let new_owner = original.files[&archive].with_extension("new-owner");
+        fs::copy(
+            fixture
+                .prepared
+                .physical(&original.files[&archive])
+                .unwrap(),
+            fixture.prepared.physical(&new_owner).unwrap(),
+        )
+        .unwrap();
+        let mut current = Delivered {
+            version: 6,
+            compiler_status: Some(0),
+            owned: BTreeMap::from([(archive.clone(), Representation::Copy)]),
+            files: BTreeMap::from([(archive.clone(), new_owner)]),
+            trees: BTreeMap::new(),
+        };
+        fixture
+            .prepared
+            .publish_receipt(&archive, &current)
+            .unwrap();
+        let args = [
+            OsString::from("--crate-type=lib"),
+            OsString::from("--extern"),
+            format!("dep={}", direct.display()).into(),
+        ];
+        assert_eq!(
+            fixture
+                .prepared
+                .dependencies(&args, &mut BTreeMap::new())
+                .unwrap(),
+            original.files
+        );
+        let bytes = fs::read(&archive).unwrap();
+        let mut changed = bytes.clone();
+        changed[0] ^= 1;
+        fs::write(&archive, changed).unwrap();
+        assert!(
+            fixture
+                .prepared
+                .dependencies(&args, &mut BTreeMap::new())
+                .is_err()
+        );
+        fs::write(&archive, bytes).unwrap();
+        current.version = 5;
+        fixture
+            .prepared
+            .publish_receipt(&archive, &current)
+            .unwrap();
+        assert!(
+            fixture
+                .prepared
+                .dependencies(&args, &mut BTreeMap::new())
+                .is_err()
+        );
+        // Unlike Copy, a StoreLink cannot authenticate a different merged owner,
+        // even if both backings contain the same bytes.
+        current.version = 6;
+        let metadata = archive.with_extension("rmeta");
+        current.owned.insert(metadata.clone(), Representation::Copy);
+        current
+            .files
+            .insert(metadata.clone(), original.files[&metadata].clone());
+        current
+            .owned
+            .insert(archive.clone(), Representation::StoreLink);
+        fixture.prepared.config.artifact_delivery = ArtifactDelivery::SystemStoreRlibLinks;
+        fixture.prepared.config.store_mode = StoreMode::System;
+        fixture
+            .prepared
+            .publish_receipt(&archive, &current)
+            .unwrap();
+        let error = fixture
+            .prepared
+            .dependencies(&args, &mut BTreeMap::new())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from merged dependency owner")
+        );
+    }
+
+    #[test]
+    fn absent_probe_directories_retain_backing_but_symlinked_ancestors_and_receipts_fail() {
+        let fixture = ArtifactFixture::new();
+        let mut receipt = fixture.receipt("debug/build/probe/out");
+        receipt.compiler_status = Some(1 << 8);
+        for target in receipt.owned.keys() {
+            fixture.prepared.publish_receipt(target, &receipt).unwrap();
+        }
+        let present = fixture.prepared.snapshot_references().unwrap();
+        let directory = fixture.prepared.config.target.join("debug/build/probe");
+        fs::remove_dir_all(&directory).unwrap();
+        let absent = fixture.prepared.snapshot_references().unwrap();
+        assert_eq!(absent.owned_files, 0);
+        assert_eq!(absent.store_paths, present.store_paths);
+        // A dangling ancestor link must not be mistaken for a removed probe.
+        unix_fs::symlink(fixture.root.join("missing"), &directory).unwrap();
+        assert!(fixture.prepared.snapshot_references().is_err());
+        fs::remove_file(&directory).unwrap();
+        let state = fixture.prepared.config.target.join(".dyndrv-delivered");
+        let moved = fixture.root.join("moved-receipts");
+        fs::rename(&state, &moved).unwrap();
+        unix_fs::symlink(&moved, &state).unwrap();
+        assert!(fixture.prepared.snapshot_references().is_err());
+        assert!(
+            fixture
+                .prepared
+                .delivered(receipt.owned.keys().next().unwrap())
+                .is_err()
+        );
+        fs::remove_file(&state).unwrap();
+        fs::rename(&moved, &state).unwrap();
+        let target = receipt.owned.keys().next().unwrap();
+        fs::remove_file(fixture.prepared.physical(&receipt.files[target]).unwrap()).unwrap();
+        assert!(fixture.prepared.snapshot_references().is_err());
+    }
 
     #[test]
     fn bound_package_inputs_require_the_same_directory_and_a_whole_store_root() {
@@ -2493,6 +3179,8 @@ mod tests {
             dependencies: BTreeMap::new(),
         };
         let copying = serde_json::to_vec(&invocation).unwrap();
+        let request = serde_json::to_value(&invocation).unwrap();
+        assert!(request.get("artifact_delivery").is_none());
         assert!(matches!(
             invocation.writable(&source).as_slice(),
             [source_wrap::Writable::Directory(path), source_wrap::Writable::ScratchDirectory(cwd)]
@@ -2561,6 +3249,7 @@ mod tests {
                 socket: PathBuf::new(),
                 real_store: root.join("store"),
                 store_mode: Default::default(),
+                artifact_delivery: ArtifactDelivery::Copy,
                 gc_roots: None,
                 source: root.join("source"),
                 package_sources: Vec::new(),
@@ -2640,10 +3329,13 @@ mod tests {
                 fs::write(
                     backend.receipt(&target.join(name)),
                     serde_json::to_vec(&Delivered {
-                        version: 5,
+                        version: 6,
                         trees: sources.clone(),
                         compiler_status,
-                        owned: names.iter().map(|name| target.join(name)).collect(),
+                        owned: names
+                            .iter()
+                            .map(|name| (target.join(name), Representation::Copy))
+                            .collect(),
                         files: contents.clone(),
                     })
                     .unwrap(),
@@ -2721,14 +3413,19 @@ mod tests {
         let parsed = backend.delivered(&archive).unwrap();
         let mut verifier = Verifier::default();
         backend
-            .validate_receipt_contents(&archive, &parsed, &mut verifier)
+            .validate_receipt_contents(&archive, &parsed, &parsed.files[&archive], &mut verifier)
             .unwrap();
         let mut bytes = fs::read(&archive).unwrap();
         bytes[0] ^= 1;
         fs::write(&archive, &bytes).unwrap();
         assert!(
             backend
-                .validate_receipt_contents(&archive, &parsed, &mut verifier)
+                .validate_receipt_contents(
+                    &archive,
+                    &parsed,
+                    &parsed.files[&archive],
+                    &mut verifier
+                )
                 .is_err()
         );
         assert!(
@@ -2758,15 +3455,15 @@ mod tests {
         );
         let mut invalid = backend.delivered(&archive).unwrap();
         invalid.version = 4;
-        assert!(invalid.validate(&archive).is_err());
+        assert!(invalid.validate(&archive, &backend.config).is_err());
         backend.publish_receipt(&archive, &invalid).unwrap();
         assert!(backend.validate_replacement(&archive).is_err());
         assert!(backend.snapshot_references().is_err());
-        invalid.version = 5;
+        invalid.version = 6;
         // Keep this key mapped while removing another owned file's mapping.
         invalid.files.remove(&target.join("leaf.d")).unwrap();
         assert!(invalid.files.contains_key(&archive));
-        assert!(invalid.validate(&archive).is_err());
+        assert!(invalid.validate(&archive, &backend.config).is_err());
         backend.publish_receipt(&archive, &invalid).unwrap();
         assert!(backend.validate_replacement(&archive).is_err());
         assert!(backend.snapshot_references().is_err());
@@ -2877,6 +3574,7 @@ mod tests {
                 socket: PathBuf::new(),
                 real_store: root.join("store"),
                 store_mode: Default::default(),
+                artifact_delivery: ArtifactDelivery::Copy,
                 gc_roots: None,
                 source: root.join("source"),
                 package_sources: Vec::new(),
@@ -2917,10 +3615,10 @@ mod tests {
             fs::write(
                 backend.receipt(&local),
                 serde_json::to_vec(&Delivered {
-                    version: 5,
+                    version: 6,
                     trees: BTreeMap::new(),
                     compiler_status: Some(0),
-                    owned: BTreeSet::from([local.clone()]),
+                    owned: BTreeMap::from([(local.clone(), Representation::Copy)]),
                     files,
                 })
                 .unwrap(),
@@ -2973,10 +3671,13 @@ mod tests {
             .publish_receipt(
                 &local,
                 &Delivered {
-                    version: 5,
+                    version: 6,
                     trees: BTreeMap::new(),
                     compiler_status: Some(1 << 8),
-                    owned: BTreeSet::from([local.clone(), own_object.clone()]),
+                    owned: BTreeMap::from([
+                        (local.clone(), Representation::Copy),
+                        (own_object.clone(), Representation::Copy),
+                    ]),
                     files: BTreeMap::from([
                         (local.clone(), inputs[&local].clone()),
                         (own_object.clone(), object_owner.clone()),
