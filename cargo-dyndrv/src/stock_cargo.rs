@@ -2,21 +2,23 @@
 //! execution; Nix mode binds actual commands to immutable compiler inputs. Cargo
 //! retains command construction, scheduling, build scripts and target ownership.
 mod nix;
-use color_eyre::eyre::{self, Context, bail};
+use self::nix::Backend;
+use color_eyre::eyre;
+use color_eyre::eyre::{Context, bail};
 use serde::{Deserialize, Serialize};
-use std::{
-    ffi::{OsStr, OsString},
-    fs::{self, DirBuilder, OpenOptions},
-    io::Write,
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::{DirBuilderExt, OpenOptionsExt, symlink},
-        process::{CommandExt, ExitStatusExt},
-    },
-    path::{Path, PathBuf},
-    process::{Command, ExitStatus},
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+use std::env;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::fs::{DirBuilder, OpenOptions};
+use std::io::Write;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::process::{Command, ExitStatus};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const RUSTC_WRAPPER: &str = "dyndrv-stock-rustc";
 const RUSTDOC_WRAPPER: &str = "dyndrv-stock-rustdoc";
@@ -27,7 +29,7 @@ struct Session {
     version: u32,
     rustdoc: Vec<u8>,
     #[serde(default)]
-    nix: Option<nix::Prepared>,
+    nix: Option<Backend>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -35,6 +37,27 @@ struct Session {
 struct Completion {
     version: u32,
     status: i32,
+    nix_invocations: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum Execution {
+    NativeDoctest,
+    NativeRustdoc,
+    NativeProbe,
+    NixCompiler,
+    NativeExecNotNix,
+}
+
+impl Execution {
+    fn completion(self) -> Option<(&'static str, &'static [u8])> {
+        match self {
+            Self::NixCompiler => Some(("nix-complete", b"delivered\n")),
+            Self::NativeDoctest | Self::NativeRustdoc => Some(("native-complete", b"executed\n")),
+            Self::NativeProbe | Self::NativeExecNotNix => None,
+        }
+    }
 }
 
 impl Session {
@@ -49,11 +72,9 @@ impl Session {
             .mode(0o700)
             .create(root.join("invocations"))?;
         let session = Self {
-            version: 1,
+            version: 2,
             rustdoc: rustdoc.as_os_str().as_bytes().to_vec(),
-            nix: config
-                .map(|path| nix::Prepared::prepare(path, &root.join("prepare.json")))
-                .transpose()?,
+            nix: config.map(Backend::configure).transpose()?,
         };
         let mut file = OpenOptions::new()
             .write(true)
@@ -62,9 +83,9 @@ impl Session {
             .open(root.join("session.json"))?;
         serde_json::to_writer(&mut file, &session)?;
         file.write_all(b"\n")?;
-        let executable = std::env::current_exe()?;
+        let executable = env::current_exe()?;
         for name in [RUSTC_WRAPPER, RUSTDOC_WRAPPER] {
-            symlink(&executable, root.join("bin").join(name))?;
+            unix_fs::symlink(&executable, root.join("bin").join(name))?;
         }
         Ok(session)
     }
@@ -75,7 +96,7 @@ impl Session {
             .and_then(Path::parent)
             .ok_or_else(|| eyre::eyre!("wrapper lacks a capture directory"))?;
         let session: Self = serde_json::from_slice(&fs::read(root.join("session.json"))?)?;
-        if session.version != 1 {
+        if session.version != 2 {
             bail!("unsupported stock-Cargo capture version");
         }
         let rustdoc = OsString::from_vec(session.rustdoc);
@@ -88,12 +109,22 @@ impl Session {
             (&rustdoc, arguments, "rustdoc")
         };
         let native_rustdoc = session.nix.is_some() && role == "rustdoc";
-        let execution = if Self::is_doctest(role, arguments) {
-            "native-doctest"
+        let execution = if native_rustdoc {
+            if Self::is_doctest(role, arguments) {
+                Execution::NativeDoctest
+            } else {
+                Execution::NativeRustdoc
+            }
+        } else if session.nix.is_some() {
+            if Backend::is_probe(program, arguments) {
+                Execution::NativeProbe
+            } else {
+                Execution::NixCompiler
+            }
         } else {
-            "native-rustdoc"
+            Execution::NativeExecNotNix
         };
-        let mut environment_names: Vec<_> = std::env::vars_os()
+        let mut environment_names: Vec<_> = env::vars_os()
             .map(|(name, _)| name.as_bytes().to_vec())
             .collect();
         environment_names.sort();
@@ -101,20 +132,20 @@ impl Session {
         let observation = serde_json::json!({
             "version": 1,
             "role": role,
-            "pid": std::process::id(),
+            "pid": process::id(),
             "capturedUnixNanoseconds": timestamp.to_string(),
             "program": program.as_bytes(),
             "arguments": arguments.iter().map(|arg| arg.as_bytes()).collect::<Vec<_>>(),
-            "cwd": std::env::current_dir()?.as_os_str().as_bytes(),
+            "cwd": env::current_dir()?.as_os_str().as_bytes(),
             // Do not serialize arbitrary environment values (including licenses).
             // Effective-environment replay requires a separate explicit contract.
             "environmentNames": environment_names,
-            "jobserver": std::env::var_os("CARGO_MAKEFLAGS").map(|value| value.as_bytes().to_vec()),
-            "execution": if native_rustdoc { execution } else if session.nix.is_some() { "nix-request-or-native-probe" } else { "native-exec-not-nix" },
+            "jobserver": env::var_os("CARGO_MAKEFLAGS").map(|value| value.as_bytes().to_vec()),
+            "execution": execution,
         });
         let destination = root
             .join("invocations")
-            .join(format!("{}-{timestamp}.json", std::process::id()));
+            .join(format!("{}-{timestamp}.json", process::id()));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -143,8 +174,9 @@ impl Session {
             Self::exit(status);
         }
         if let Some(backend) = session.nix
-            && !nix::Prepared::is_probe(program, arguments)
+            && execution == Execution::NixCompiler
         {
+            let backend = backend.prepare(root)?;
             let status = backend.execute(&destination, program, arguments, role)?;
             // Build scripts may swallow wrapper failures as negative capability
             // probes. Only completed delivery permits the outer Cargo success.
@@ -165,48 +197,53 @@ impl Session {
         if root.join("cargo-result.json").try_exists()? {
             bail!("a completed Cargo session cannot be reused");
         }
-        let status = command.status().wrap_err("executing unmodified Cargo")?;
-        if status.success() {
-            for entry in fs::read_dir(root.join("invocations"))? {
-                let path = entry?.path();
-                if path.extension() != Some(OsStr::new("json")) {
-                    continue;
-                }
-                let record: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
-                if record.get("version") != Some(&serde_json::json!(1)) {
-                    continue; // Nix delivery receipts have no observation version.
-                }
-                let arguments: Vec<Vec<u8>> = serde_json::from_value(record["arguments"].clone())?;
-                let arguments: Vec<_> = arguments.into_iter().map(OsString::from_vec).collect();
-                let program =
-                    OsString::from_vec(serde_json::from_value(record["program"].clone())?);
-                let (extension, expected): (&str, &[u8]) =
-                    if record["role"].as_str() == Some("rustdoc") {
-                        ("native-complete", b"executed\n")
-                    } else {
-                        ("nix-complete", b"delivered\n")
-                    };
-                if !nix::Prepared::is_probe(&program, &arguments)
-                    && fs::read(path.with_extension(extension)).ok().as_deref() != Some(expected)
-                {
-                    if let Some(backend) = &self.nix {
-                        backend.reject_incomplete()?;
-                    }
-                    bail!(
-                        "Cargo succeeded after an incomplete Nix compiler invocation: {}; a build script may have swallowed a backend error",
-                        path.display()
-                    );
-                }
+        let status = command.status();
+        let mut nix_invocations = 0;
+        let mut incomplete = None;
+        for entry in fs::read_dir(root.join("invocations"))? {
+            let path = entry?.path();
+            if path.extension() != Some(OsStr::new("json")) {
+                continue;
+            }
+            let record: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+            if record.get("version") != Some(&serde_json::json!(1)) {
+                continue; // Nix delivery receipts have no observation version.
+            }
+            let execution = Execution::deserialize(&record["execution"])?;
+            if execution == Execution::NixCompiler {
+                nix_invocations += 1;
+            }
+            if status.as_ref().is_ok_and(ExitStatus::success)
+                && let Some((extension, expected)) = execution.completion()
+                && fs::read(path.with_extension(extension)).ok().as_deref() != Some(expected)
+            {
+                incomplete.get_or_insert(path);
             }
         }
-        nix::Prepared::write_json(
+        if incomplete.is_some()
+            && let Some(backend) = &self.nix
+        {
+            backend.reject_incomplete()?;
+        }
+        Backend::write_json(
             &root.join("cargo-result.json"),
             &Completion {
-                version: 1,
-                status: status.into_raw(),
+                version: 2,
+                status: if incomplete.is_some() {
+                    1 << 8
+                } else {
+                    status.as_ref().map_or(1 << 8, |status| status.into_raw())
+                },
+                nix_invocations,
             },
         )?;
-        Ok(status)
+        if let Some(path) = incomplete {
+            bail!(
+                "Cargo succeeded after an incomplete Nix compiler invocation: {}; a build script may have swallowed a backend error",
+                path.display()
+            );
+        }
+        status.wrap_err("executing unmodified Cargo")
     }
 
     fn snapshot_references(arguments: &[OsString]) -> eyre::Result<()> {
@@ -230,7 +267,7 @@ impl Session {
         let session: Self = serde_json::from_slice(&fs::read(root.join("session.json"))?)?;
         let completion: Completion =
             serde_json::from_slice(&fs::read(root.join("cargo-result.json"))?)?;
-        if session.version != 1 || completion.version != 1 || completion.status != 0 {
+        if session.version != 2 || completion.version != 2 || completion.status != 0 {
             bail!("snapshot references require a successfully completed Cargo session");
         }
         let backend = session
@@ -238,7 +275,7 @@ impl Session {
             .ok_or_else(|| eyre::eyre!("snapshot references require Nix artifact ownership"))?;
         // Reuse the completed session's owner. Do not prepare another source
         // import, contact a daemon or realize an absent backing output.
-        nix::Prepared::write_json(Path::new(destination), &backend.snapshot_references()?)
+        Backend::write_json(Path::new(destination), &backend.snapshot_references()?)
     }
 
     fn exit(status: ExitStatus) -> ! {
@@ -250,7 +287,7 @@ impl Session {
                 libc::raise(signal);
             }
         }
-        std::process::exit(status.code().unwrap_or(1));
+        process::exit(status.code().unwrap_or(1));
     }
 }
 
@@ -264,7 +301,7 @@ pub(crate) fn dispatch(arguments: &[OsString]) -> Option<eyre::Result<()>> {
         return Some(Session::execute(executable, &arguments[1..]));
     }
     if arguments.get(1).is_some_and(|arg| arg == "stock-compile") {
-        return Some(nix::Prepared::build(&arguments[2..]));
+        return Some(Backend::build(&arguments[2..]));
     }
     if arguments
         .get(1)
@@ -313,7 +350,7 @@ fn capture(arguments: &[OsString], use_nix: bool) -> eyre::Result<()> {
     if separator != "--" || caller.is_empty() || !cargo.is_absolute() || !cargo.is_file() {
         bail!("an absolute Cargo executable and Cargo arguments after -- are required");
     }
-    if std::env::var_os("RUSTC_WRAPPER").is_some_and(|value| !value.is_empty()) {
+    if env::var_os("RUSTC_WRAPPER").is_some_and(|value| !value.is_empty()) {
         bail!("capture-cargo requires exclusive ownership of RUSTC_WRAPPER");
     }
     if use_nix != nix_config.is_some() {
@@ -336,88 +373,140 @@ fn capture(arguments: &[OsString], use_nix: bool) -> eyre::Result<()> {
 mod tests {
     use super::*;
 
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = env::temp_dir().join(format!(
+                "dyndrv-cargo-completion-{}-{}",
+                process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(root.join("invocations")).unwrap();
+            Self(root)
+        }
+
+        fn record(&self, name: &str, execution: Execution) -> PathBuf {
+            let path = self.0.join("invocations").join(format!("{name}.json"));
+            Backend::write_json(
+                &path,
+                &serde_json::json!({
+                    "version": 1, "execution": execution,
+                }),
+            )
+            .unwrap();
+            path
+        }
+
+        fn run(&self, status: u8) -> eyre::Result<ExitStatus> {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", &format!("exit {status}")]);
+            Session {
+                version: 2,
+                rustdoc: vec![],
+                nix: None,
+            }
+            .run_cargo(&self.0, &mut command)
+        }
+
+        fn completion(&self) -> Completion {
+            serde_json::from_slice(&fs::read(self.0.join("cargo-result.json")).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
     #[test]
-    fn cargo_success_requires_every_compilation_to_complete() {
-        let root = std::env::temp_dir().join(format!(
-            "dyndrv-cargo-completion-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(root.join("invocations")).unwrap();
-        let record = root.join("invocations/1-1.json");
-        fs::write(
-            &record,
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1, "program": b"rustc".as_slice(), "arguments": [b"probe.rs".as_slice()]
-            }))
-            .unwrap(),
+    fn completion_counts_actual_immutable_invocations_including_negative_probes() {
+        let fixture = Fixture::new();
+        let positive = fixture.record("positive", Execution::NixCompiler);
+        let negative = fixture.record("negative", Execution::NixCompiler);
+        fixture.record("version-probe", Execution::NativeProbe);
+        for path in [&positive, &negative] {
+            fs::write(path.with_extension("nix-complete"), b"delivered\n").unwrap();
+        }
+        // A completed compiler error is a real immutable invocation. Result
+        // files alone cannot distinguish it from early/unfinished metadata.
+        Backend::write_json(
+            &negative.with_extension("nix-result.json"),
+            &serde_json::json!({"status": 1 << 8}),
         )
         .unwrap();
-        let mut success = Command::new("/bin/sh");
-        success.args(["-c", "exit 0"]);
+        for (name, execution) in [
+            ("doc", Execution::NativeRustdoc),
+            ("doctest", Execution::NativeDoctest),
+        ] {
+            let path = fixture.record(name, execution);
+            fs::write(path.with_extension("native-complete"), b"executed\n").unwrap();
+        }
+        assert!(fixture.run(0).unwrap().success());
+        let completion = fixture.completion();
+        assert_eq!(completion.version, 2);
+        assert_eq!(completion.status, 0);
+        assert_eq!(completion.nix_invocations, 2);
+        assert!(
+            fixture.run(0).is_err(),
+            "completed sessions cannot be reused"
+        );
+    }
+
+    #[test]
+    fn swallowed_preparation_and_early_metadata_failures_remain_incomplete() {
+        for metadata in [false, true] {
+            let fixture = Fixture::new();
+            let path = fixture.record("incomplete", Execution::NixCompiler);
+            if metadata {
+                // Neither an early result nor a native completion establishes
+                // completed immutable compiler delivery.
+                Backend::write_json(
+                    &path.with_extension("nix-result.json"),
+                    &serde_json::json!({"metadata": true}),
+                )
+                .unwrap();
+                fs::write(path.with_extension("native-complete"), b"executed\n").unwrap();
+            }
+            assert!(fixture.run(0).is_err());
+            let completion = fixture.completion();
+            assert_ne!(completion.status, 0);
+            assert_eq!(completion.nix_invocations, 1);
+        }
+    }
+
+    #[test]
+    fn native_completion_and_failed_cargo_keep_distinct_counts() {
+        for execution in [Execution::NativeRustdoc, Execution::NativeDoctest] {
+            let fixture = Fixture::new();
+            let path = fixture.record("native", execution);
+            fs::write(path.with_extension("nix-complete"), b"delivered\n").unwrap();
+            assert!(fixture.run(0).is_err());
+            assert_eq!(fixture.completion().nix_invocations, 0);
+        }
+        let fixture = Fixture::new();
+        fixture.record("incomplete", Execution::NixCompiler);
+        assert_eq!(fixture.run(23).unwrap().code(), Some(23));
+        assert_eq!(fixture.completion().status, 23 << 8);
+        assert_eq!(fixture.completion().nix_invocations, 1);
+    }
+
+    #[test]
+    fn cargo_spawn_failure_records_an_unsuccessful_empty_session() {
+        let fixture = Fixture::new();
         let session = Session {
-            version: 1,
+            version: 2,
             rustdoc: vec![],
             nix: None,
         };
-        assert!(session.run_cargo(&root, &mut success).is_err());
-        fs::write(record.with_extension("nix-complete"), b"delivered\n").unwrap();
-        assert!(session.run_cargo(&root, &mut success).unwrap().success());
-        let completed: Completion =
-            serde_json::from_slice(&fs::read(root.join("cargo-result.json")).unwrap()).unwrap();
-        assert_eq!(completed.status, 0);
-        assert!(session.run_cargo(&root, &mut success).is_err());
-        fs::remove_file(root.join("cargo-result.json")).unwrap();
-        fs::remove_file(record.with_extension("nix-complete")).unwrap();
-        fs::write(
-            &record,
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1, "program": b"rustc".as_slice(), "arguments": [b"-vV".as_slice()]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(session.run_cargo(&root, &mut success).unwrap().success());
-        fs::remove_file(root.join("cargo-result.json")).unwrap();
-        fs::write(
-            &record,
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1, "role": "rustdoc", "program": b"rustdoc".as_slice(),
-                "arguments": [b"--test".as_slice(), b"lib.rs".as_slice()]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        // Cached compiler delivery cannot stand in for actual doctest execution.
-        fs::write(record.with_extension("nix-complete"), b"delivered\n").unwrap();
-        assert!(session.run_cargo(&root, &mut success).is_err());
-        fs::write(record.with_extension("native-complete"), b"executed\n").unwrap();
-        assert!(session.run_cargo(&root, &mut success).unwrap().success());
-        fs::remove_file(root.join("cargo-result.json")).unwrap();
-        fs::write(
-            &record,
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1, "role": "rustdoc", "program": b"rustdoc".as_slice(),
-                "arguments": [b"lib.rs".as_slice()]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::remove_file(record.with_extension("native-complete")).unwrap();
-        assert!(session.run_cargo(&root, &mut success).is_err());
-        fs::write(record.with_extension("native-complete"), b"executed\n").unwrap();
-        assert!(session.run_cargo(&root, &mut success).unwrap().success());
-        fs::remove_file(root.join("cargo-result.json")).unwrap();
-        let mut failed = Command::new("/bin/sh");
-        failed.args(["-c", "exit 23"]);
-        assert_eq!(
-            session.run_cargo(&root, &mut failed).unwrap().code(),
-            Some(23)
-        );
-        fs::remove_dir_all(root).unwrap();
+        let mut command = Command::new(fixture.0.join("absent-cargo"));
+        assert!(session.run_cargo(&fixture.0, &mut command).is_err());
+        assert_eq!(fixture.completion().status, 1 << 8);
+        assert_eq!(fixture.completion().nix_invocations, 0);
     }
 
     #[test]
@@ -431,10 +520,10 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&root).unwrap();
-        nix::Prepared::write_json(
+        Backend::write_json(
             &root.join("session.json"),
             &Session {
-                version: 1,
+                version: 2,
                 rustdoc: vec![],
                 nix: None,
             },
@@ -449,9 +538,13 @@ mod tests {
         ];
         assert!(Session::snapshot_references(&arguments).is_err());
         for status in [256, 0] {
-            nix::Prepared::write_json(
+            Backend::write_json(
                 &root.join("cargo-result.json"),
-                &Completion { version: 1, status },
+                &Completion {
+                    version: 2,
+                    status,
+                    nix_invocations: 0,
+                },
             )
             .unwrap();
             assert!(Session::snapshot_references(&arguments).is_err());

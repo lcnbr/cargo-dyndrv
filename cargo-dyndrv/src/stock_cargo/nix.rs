@@ -20,7 +20,9 @@ use harmonia_store_derivation::{
 use harmonia_store_path::{StoreDir, StorePath, StorePathName};
 use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore};
 use harmonia_utils_hash::{Algorithm::SHA256, HashFormat};
-use libc::{AT_EACCESS, AT_FDCWD, EACCES, EROFS, ST_RDONLY, W_OK};
+use libc::{
+    AT_EACCESS, AT_FDCWD, EACCES, EROFS, O_CLOEXEC, O_NOFOLLOW, O_NONBLOCK, ST_RDONLY, W_OK,
+};
 use serde::{Deserialize, Serialize};
 use source_wrap::{Verifier, same_contents};
 use std::borrow::Cow;
@@ -28,6 +30,7 @@ use std::ffi::CString;
 use std::fs::{File, Metadata, Permissions};
 use std::io;
 use std::io::Error as IoError;
+use std::iter;
 use std::mem::MaybeUninit;
 use std::os::unix::fs as unix_fs;
 use std::process;
@@ -177,10 +180,80 @@ struct Config {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Prepared {
+pub(super) struct Backend {
     config: Config,
+    // Ownership/audit operations need only configuration. Compiler inputs exist
+    // only after the session's single, atomically published preparation.
+    #[serde(skip)]
+    compiler_inputs: Option<CompilerInputs>,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompilerInputs {
     trees: BTreeMap<PathBuf, PathBuf>,
     builder_store: PathBuf,
+}
+
+impl CompilerInputs {
+    fn in_session(
+        session: &Path,
+        prepare: impl FnOnce() -> eyre::Result<Self>,
+    ) -> eyre::Result<Self> {
+        let directory = jobserver::Broker::directory(session)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+            .open(session.join("prepare.lock"))?;
+        let info = lock.metadata()?;
+        if !info.is_file()
+            || info.uid() != directory.metadata()?.uid()
+            || info.nlink() != 1
+            || info.mode() & 0o077 != 0
+        {
+            bail!("compiler preparation lock must be a private, owned regular file");
+        }
+        // Intentionally hold the process-shared lock through capture and import:
+        // every compiler must use the same complete source view, exactly once.
+        // Keep its inode after release so concurrent waiters cannot split owners.
+        lock.lock()?;
+        let published = session.join("compiler-inputs.json");
+        match published.symlink_metadata() {
+            Ok(info) => {
+                if !info.is_file() || info.uid() != directory.metadata()?.uid() {
+                    bail!("published compiler inputs must be an owned regular file");
+                }
+                return Ok(serde_json::from_slice(&fs::read(published)?)?);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Exclusive creation rejects a failed or interrupted initializer instead
+        // of quietly capturing a different source view on a later wrapper call.
+        Backend::write_json(&session.join("prepare-started.json"), &process::id())
+            .wrap_err("compiler session initialization was already attempted but not published")?;
+        let inputs = prepare()?;
+        let staged = session.join("compiler-inputs.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staged)?;
+        let result = (|| {
+            serde_json::to_writer(&mut file, &inputs)?;
+            file.write_all(b"\n")?;
+            fs::rename(&staged, &published)?;
+            Ok(inputs)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(staged);
+        }
+        result
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -431,7 +504,7 @@ impl CompilerOutput {
             Self::Directory(path) | Self::File(path) => path,
             Self::Stdout => return Ok(()),
         };
-        Prepared::scratch(path)?;
+        Backend::scratch(path)?;
         if !path.starts_with(target) || path == target {
             bail!("compiler output must be inside the Cargo target");
         }
@@ -484,7 +557,7 @@ impl Invocation {
     }
 }
 
-impl Prepared {
+impl Backend {
     fn configured_socket(config: &Config) -> eyre::Result<PathBuf> {
         match config.store_mode {
             StoreMode::Private => {
@@ -767,14 +840,15 @@ impl Prepared {
         .then_some(root))
     }
 
-    #[tokio::main(flavor = "current_thread")]
-    pub(super) async fn prepare(path: &Path, evidence: &Path) -> eyre::Result<Self> {
-        let started = Instant::now();
+    pub(super) fn configure(path: &Path) -> eyre::Result<Self> {
         let config: Config = serde_json::from_slice(&fs::read(path)?)?;
         if config.private_target && !config.source_overlay {
             bail!("private target storage requires source overlays");
         }
         Self::configured_socket(&config)?;
+        if let Some(directory) = &config.gc_roots {
+            jobserver::Broker::directory(directory)?;
+        }
         let store_dir = StoreDir::default();
         Tool::bound(&store_dir, &config.nix)?;
         Self::scratch(&config.source)?;
@@ -823,6 +897,53 @@ impl Prepared {
         if references.is_empty() {
             bail!("explicit compiler and builder runtime inputs required")
         }
+        let mut roots = BTreeSet::new();
+        for source in iter::once(&config.source).chain(&config.package_sources) {
+            if source.starts_with(&config.target)
+                || roots
+                    .iter()
+                    .any(|root: &&PathBuf| root.starts_with(source) || source.starts_with(root))
+            {
+                bail!("source roots must be disjoint and cannot be inside target");
+            }
+            if !source.is_dir() {
+                bail!(
+                    "compiler source root must be a directory: {}",
+                    source.display()
+                );
+            }
+            roots.insert(source);
+        }
+        Ok(Self {
+            config,
+            compiler_inputs: None,
+        })
+    }
+
+    pub(super) fn prepare(mut self, session: &Path) -> eyre::Result<Self> {
+        self.compiler_inputs = Some(CompilerInputs::in_session(session, || {
+            self.prepare_inputs(&session.join("prepare.json"))
+        })?);
+        Ok(self)
+    }
+
+    fn compiler_inputs(&self) -> eyre::Result<&CompilerInputs> {
+        self.compiler_inputs
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("compiler inputs have not been prepared"))
+    }
+
+    #[tokio::main(flavor = "current_thread")]
+    async fn prepare_inputs(&self, evidence: &Path) -> eyre::Result<CompilerInputs> {
+        let started = Instant::now();
+        let config = &self.config;
+        Self::configured_socket(config)?;
+        let store_dir = StoreDir::default();
+        let references = config
+            .inputs
+            .iter()
+            .map(|path| Self::store_path(path))
+            .collect::<eyre::Result<BTreeSet<_>>>()?;
         let handshake_started = Instant::now();
         let mut daemon = harmonia_store_remote::DaemonClientBuilder::new()
             .set_store_dir(&store_dir)
@@ -833,15 +954,11 @@ impl Prepared {
         let handshake_seconds = handshake_started.elapsed().as_secs_f64();
         let mut trees = BTreeMap::new();
         let mut tree_times = Vec::new();
-        for source in std::iter::once(&config.source).chain(&config.package_sources) {
+        for source in iter::once(&config.source).chain(&config.package_sources) {
             let tree_started = Instant::now();
-            if source.starts_with(&config.target)
-                || trees
-                    .keys()
-                    .any(|root: &PathBuf| root.starts_with(source) || source.starts_with(root))
-            {
-                bail!("source roots must be disjoint and cannot be inside target");
-            }
+            // Staging precedes Cargo; this complete immutable view is fixed at
+            // the first compiler. Native build-script outputs under target are
+            // excluded here and captured per invocation from OUT_DIR/-L below.
             // Namespace package mounts can have scratch paths while retaining
             // the exact directory identity of a registered immutable store root.
             // Subdirectories and lookalike trees still take the validated NAR route.
@@ -890,13 +1007,12 @@ impl Prepared {
             .path
             .to_absolute_path(&store_dir);
         let builder_seconds = builder_started.elapsed().as_secs_f64();
-        let prepared = Self {
-            config,
+        let prepared = CompilerInputs {
             trees,
             builder_store,
         };
         let guard_started = Instant::now();
-        if prepared.config.gc_roots.is_some() {
+        if config.gc_roots.is_some() {
             let references = prepared
                 .trees
                 .values()
@@ -914,7 +1030,7 @@ impl Prepared {
                 .await?
                 .path
                 .to_absolute_path(&store_dir);
-            prepared.pin(&mut daemon, &guard).await?;
+            self.pin(&mut daemon, &guard).await?;
         }
         Self::write_json(
             evidence,
@@ -1258,6 +1374,7 @@ impl Prepared {
                 // its producer's snapshot. Other generated sources keep their
                 // immutable owner, which the target's GC roots retain.
                 let (root, input) = self
+                    .compiler_inputs()?
                     .trees
                     .iter()
                     .chain(trees.iter())
@@ -1700,7 +1817,7 @@ impl Prepared {
         }
         environment.sort();
         let trees = Self::source_trees(
-            &self.trees,
+            &self.compiler_inputs()?.trees,
             &cwd,
             args.iter().map(|value| value.as_bytes()),
             // Layout values still reach rustc and determine its request. They
@@ -1745,6 +1862,7 @@ impl Prepared {
         role: &str,
     ) -> eyre::Result<ExitStatus> {
         let started = Instant::now();
+        let inputs = self.compiler_inputs()?;
         Self::configured_socket(&self.config)?;
         let mut invocation = self.invocation(program, args, role)?;
         let _incremental_lock = invocation
@@ -1767,7 +1885,7 @@ impl Prepared {
             || invocation.cwd.join("Cargo.toml").is_symlink())
         {
             Self::scratch(&invocation.cwd)?;
-            let input = &self.trees[&self.config.source];
+            let input = &inputs.trees[&self.config.source];
             let alias = WorkspaceAlias::new(
                 &invocation.cwd,
                 &self.config.source,
@@ -1829,7 +1947,7 @@ impl Prepared {
             .config
             .inputs
             .iter()
-            .chain([&self.builder_store])
+            .chain([&inputs.builder_store])
             .chain(invocation.trees.values())
             .map(|p| Self::store_path(p))
             .collect::<eyre::Result<BTreeSet<_>>>()?;
@@ -1872,7 +1990,7 @@ impl Prepared {
                 .map(SingleDerivedPath::Opaque)
                 .collect(),
             platform: store::PLATFORM.clone(),
-            builder: self.builder_store.clone().into_bytes(),
+            builder: inputs.builder_store.to_path_buf().into_bytes(),
             args: vec![
                 "stock-compile".into(),
                 request_path.to_absolute_path(&store_dir).into_bytes(),
@@ -2423,14 +2541,18 @@ impl Prepared {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Completion, Session};
     use super::*;
     use std::env;
+    use std::fs::{DirBuilder, FileTimes};
+    use std::os::unix::fs::DirBuilderExt;
     use std::process;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct ArtifactFixture {
         root: PathBuf,
-        prepared: Prepared,
+        prepared: Backend,
     }
 
     impl ArtifactFixture {
@@ -2453,10 +2575,9 @@ mod tests {
             .unwrap();
             Self {
                 root,
-                prepared: Prepared {
+                prepared: Backend {
                     config,
-                    trees: BTreeMap::new(),
-                    builder_store: PathBuf::new(),
+                    compiler_inputs: None,
                 },
             }
         }
@@ -2499,6 +2620,285 @@ mod tests {
     }
 
     #[test]
+    fn session_preparation_child() {
+        let Some(session) = env::var_os("DYNDRV_TEST_PREPARATION_SESSION") else {
+            return;
+        };
+        let session = Path::new(&session);
+        let inputs = CompilerInputs::in_session(session, || {
+            assert!(!session.join("compiler-inputs.json").exists());
+            // Exclusive evidence makes a second initializer fail the test,
+            // even if both would otherwise publish equal compiler inputs.
+            Backend::write_json(&session.join("capture-owner.json"), &process::id())?;
+            if env::var_os("DYNDRV_TEST_PREPARATION_EXIT").is_some() {
+                process::exit(23); // Simulate interruption without running Rust destructors.
+            }
+            thread::sleep(Duration::from_millis(40));
+            Ok(serde_json::from_slice(&fs::read(
+                session.join("requested.json"),
+            )?)?)
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&inputs).unwrap(),
+            fs::read(session.join("expected.json")).unwrap()
+        );
+    }
+
+    #[test]
+    fn concurrent_compiler_processes_share_one_complete_preparation() {
+        let fixture = ArtifactFixture::new();
+        let session = fixture.root.join("session");
+        DirBuilder::new().mode(0o700).create(&session).unwrap();
+        let inputs = CompilerInputs {
+            trees: BTreeMap::from([(
+                fixture.prepared.config.source.to_path_buf(),
+                PathBuf::from("/nix/store/00000000000000000000000000000000-source"),
+            )]),
+            builder_store: PathBuf::from(env!("BUILD_WRAP")),
+        };
+        Backend::write_json(&session.join("requested.json"), &inputs).unwrap();
+        fs::write(
+            session.join("expected.json"),
+            serde_json::to_vec(&inputs).unwrap(),
+        )
+        .unwrap();
+        let children: Vec<_> = (0..4)
+            .map(|_| {
+                Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "stock_cargo::nix::tests::session_preparation_child",
+                        "--nocapture",
+                    ])
+                    .env("DYNDRV_TEST_PREPARATION_SESSION", &session)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in children {
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        assert!(session.join("capture-owner.json").is_file());
+        let published: CompilerInputs =
+            serde_json::from_slice(&fs::read(session.join("compiler-inputs.json")).unwrap())
+                .unwrap();
+        assert_eq!(published, inputs);
+        assert!(!session.join("compiler-inputs.tmp").exists());
+    }
+
+    #[test]
+    fn failed_or_unpublished_initialization_is_never_retried() {
+        let fixture = ArtifactFixture::new();
+        for failure in ["capture", "publication"] {
+            let session = fixture.root.join(failure);
+            DirBuilder::new().mode(0o700).create(&session).unwrap();
+            if failure == "publication" {
+                fs::write(
+                    session.join("compiler-inputs.tmp"),
+                    b"unfinished publication",
+                )
+                .unwrap();
+            }
+            assert!(
+                CompilerInputs::in_session(&session, || {
+                    if failure == "capture" {
+                        bail!("injected source capture failure");
+                    }
+                    Ok(CompilerInputs {
+                        trees: BTreeMap::new(),
+                        builder_store: PathBuf::from(env!("BUILD_WRAP")),
+                    })
+                })
+                .is_err()
+            );
+            assert!(!session.join("compiler-inputs.json").exists());
+            assert!(
+                CompilerInputs::in_session(&session, || panic!("must not prepare again")).is_err()
+            );
+            if failure == "publication" {
+                assert_eq!(
+                    fs::read(session.join("compiler-inputs.tmp")).unwrap(),
+                    b"unfinished publication"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_initializer_releases_the_lock_but_never_recaptures() {
+        let fixture = ArtifactFixture::new();
+        let session = fixture.root.join("session");
+        DirBuilder::new().mode(0o700).create(&session).unwrap();
+        let result = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stock_cargo::nix::tests::session_preparation_child",
+            ])
+            .env("DYNDRV_TEST_PREPARATION_SESSION", &session)
+            .env("DYNDRV_TEST_PREPARATION_EXIT", "1")
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(23));
+        assert!(session.join("capture-owner.json").is_file());
+        assert!(!session.join("compiler-inputs.json").exists());
+        assert!(
+            CompilerInputs::in_session(&session, || panic!(
+                "must not recapture interrupted session"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn preparation_rejects_symlinked_shared_or_nonregular_lock_files() {
+        let fixture = ArtifactFixture::new();
+        let sentinel = fixture.root.join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        for kind in ["symlink", "directory", "hardlink", "public"] {
+            let session = fixture.root.join(kind);
+            DirBuilder::new().mode(0o700).create(&session).unwrap();
+            let lock = session.join("prepare.lock");
+            match kind {
+                "symlink" => unix_fs::symlink(&sentinel, &lock).unwrap(),
+                "directory" => fs::create_dir(&lock).unwrap(),
+                "hardlink" => fs::hard_link(&sentinel, &lock).unwrap(),
+                "public" => {
+                    fs::write(&lock, b"").unwrap();
+                    fs::set_permissions(&lock, Permissions::from_mode(0o666)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                CompilerInputs::in_session(&session, || panic!("unsafe lock accepted")).is_err()
+            );
+        }
+        assert_eq!(fs::read(sentinel).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn lazy_source_view_freezes_all_roots_at_first_compiler_and_excludes_out_dir() {
+        let fixture = ArtifactFixture::new();
+        let session = fixture.root.join("session");
+        DirBuilder::new().mode(0o700).create(&session).unwrap();
+        let source = fixture.root.join("source");
+        let package = fixture.root.join("package");
+        let target = source.join("target");
+        fs::create_dir_all(target.join("build/out")).unwrap();
+        fs::create_dir(&package).unwrap();
+        let source_file = source.join("input.txt");
+        fs::write(&source_file, b"staged original").unwrap();
+        fs::write(package.join("asset.txt"), b"current macro asset").unwrap();
+        let times =
+            FileTimes::new().set_modified(source_file.metadata().unwrap().modified().unwrap());
+        // Native writes outside OUT_DIR are unsupported and timing-dependent:
+        // a cached script can write before capture; later writes do not recapture.
+        fs::write(&source_file, b"before compiler").unwrap();
+        File::options()
+            .write(true)
+            .open(&source_file)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+        fs::write(
+            target.join("build/out/generated"),
+            b"generated before compiler",
+        )
+        .unwrap();
+        let inputs = CompilerInputs::in_session(&session, || {
+            let trees = [&source, &package]
+                .into_iter()
+                .map(|root| {
+                    let nar = WorkspaceSource::new(root, root, &target)?.nar()?;
+                    Ok((root.to_path_buf(), PathBuf::from(Backend::digest(&nar))))
+                })
+                .collect::<eyre::Result<_>>()?;
+            Ok(CompilerInputs {
+                trees,
+                builder_store: PathBuf::from(env!("BUILD_WRAP")),
+            })
+        })
+        .unwrap();
+        assert_eq!(inputs.trees.len(), 2);
+        let source_digest = |root: &Path| {
+            PathBuf::from(Backend::digest(
+                &WorkspaceSource::new(root, root, &target)
+                    .unwrap()
+                    .nar()
+                    .unwrap(),
+            ))
+        };
+        assert_eq!(inputs.trees[&source], source_digest(&source));
+        assert_eq!(inputs.trees[&package], source_digest(&package));
+        fs::write(target.join("build/out/generated"), b"new generated bytes").unwrap();
+        assert_eq!(
+            inputs.trees[&source],
+            source_digest(&source),
+            "OUT_DIR is captured separately per invocation"
+        );
+        fs::write(&source_file, b"after compiler!").unwrap();
+        assert_ne!(inputs.trees[&source], source_digest(&source));
+        assert_eq!(
+            inputs,
+            CompilerInputs::in_session(&session, || panic!("source view must stay fixed")).unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_snapshot_audits_existing_artifacts_without_prepared_compiler_inputs() {
+        let fixture = ArtifactFixture::new();
+        let receipt = fixture.receipt("debug/deps");
+        for target in receipt.owned.keys() {
+            fixture.prepared.publish_receipt(target, &receipt).unwrap();
+        }
+        assert!(fixture.prepared.compiler_inputs.is_none());
+        let root = fixture.root.join("session");
+        fs::create_dir(&root).unwrap();
+        Backend::write_json(
+            &root.join("session.json"),
+            &serde_json::json!({
+                "version": 2, "rustdoc": [], "nix": fixture.prepared,
+            }),
+        )
+        .unwrap();
+        Backend::write_json(
+            &root.join("cargo-result.json"),
+            &Completion {
+                version: 2,
+                status: 0,
+                nix_invocations: 0,
+            },
+        )
+        .unwrap();
+        let output = root.join("references.json");
+        let arguments = [
+            "--directory".into(),
+            root.to_path_buf().into_os_string(),
+            "--output".into(),
+            output.to_path_buf().into_os_string(),
+        ];
+        Session::snapshot_references(&arguments).unwrap();
+        let references: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(references["ownedFiles"], receipt.owned.len());
+        assert_eq!(references["storePaths"].as_array().unwrap().len(), 1);
+        assert!(!root.join("compiler-inputs.json").exists());
+        assert!(!root.join("prepare-started.json").exists());
+        fs::remove_file(&output).unwrap();
+        fs::write(receipt.owned.keys().next().unwrap(), b"corrupt target").unwrap();
+        assert!(Session::snapshot_references(&arguments).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn artifact_delivery_defaults_and_receipts_have_explicit_representations() {
         let mut fixture = ArtifactFixture::new();
         let config = &mut fixture.prepared.config;
@@ -2508,7 +2908,7 @@ mod tests {
         encoded["artifact_delivery"] = "system-store-links".into();
         assert!(serde_json::from_value::<Config>(encoded).is_err());
         config.artifact_delivery = ArtifactDelivery::SystemStoreRlibLinks;
-        assert!(Prepared::configured_socket(config).is_err());
+        assert!(Backend::configured_socket(config).is_err());
         // Snapshot reload must rerun the live gate even with no owned links.
         assert!(fixture.prepared.snapshot_references().is_err());
         fixture.prepared.config.store_mode = StoreMode::System;
@@ -2822,20 +3222,16 @@ mod tests {
     #[test]
     fn bound_package_inputs_require_the_same_directory_and_a_whole_store_root() {
         let store_dir = StoreDir::default();
-        let input = Prepared::store_path(Path::new(env!("BUILD_WRAP")))
+        let input = Backend::store_path(Path::new(env!("BUILD_WRAP")))
             .unwrap()
             .to_absolute_path(&store_dir);
+        assert!(Backend::bound_store_root(&input, &input).unwrap().is_some());
         assert!(
-            Prepared::bound_store_root(&input, &input)
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            Prepared::bound_store_root(&input, &input.join("bin"))
+            Backend::bound_store_root(&input, &input.join("bin"))
                 .unwrap()
                 .is_none()
         );
-        assert!(Prepared::bound_store_root(&input, &input.join("../other")).is_err());
+        assert!(Backend::bound_store_root(&input, &input.join("../other")).is_err());
 
         let root = env::temp_dir().join(format!(
             "dyndrv-store-binding-{}-{}",
@@ -2847,14 +3243,10 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
         // A declared store path alone must not authenticate an unrelated mount.
-        assert!(Prepared::bound_store_root(&root, &input).unwrap().is_none());
+        assert!(Backend::bound_store_root(&root, &input).unwrap().is_none());
         let alias = root.join("alias");
         unix_fs::symlink(&input, &alias).unwrap();
-        assert!(
-            Prepared::bound_store_root(&alias, &input)
-                .unwrap()
-                .is_some()
-        );
+        assert!(Backend::bound_store_root(&alias, &input).unwrap().is_some());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2869,7 +3261,7 @@ mod tests {
         .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
         .into();
         for (root, input) in &trees {
-            let selected = Prepared::source_trees(&trees, &root.join("src"), [], []);
+            let selected = Backend::source_trees(&trees, &root.join("src"), [], []);
             assert_eq!(selected.len(), 1, "owner: {}", root.display());
             assert_eq!(selected.get(root), Some(input));
         }
@@ -2891,7 +3283,7 @@ mod tests {
         .into();
         let infrastructure = [(b"NIX_BUILD_TOP".as_slice(), b"/build".as_slice())];
         for (root, input) in &trees {
-            let selected = Prepared::source_trees(&trees, root, [], infrastructure);
+            let selected = Backend::source_trees(&trees, root, [], infrastructure);
             assert_eq!(selected, BTreeMap::from([(root.clone(), input.clone())]));
         }
         let cwd = Path::new("/build/cargo-dyndrv/sources/local");
@@ -2899,9 +3291,9 @@ mod tests {
             infrastructure[0],
             (b"DATA_ROOT".as_slice(), b"/build".as_slice()),
         ];
-        assert_eq!(Prepared::source_trees(&trees, cwd, [], environment), trees);
+        assert_eq!(Backend::source_trees(&trees, cwd, [], environment), trees);
         assert_eq!(
-            Prepared::source_trees(&trees, cwd, [b"--data=/build".as_slice()], infrastructure),
+            Backend::source_trees(&trees, cwd, [b"--data=/build".as_slice()], infrastructure),
             trees,
         );
     }
@@ -2921,11 +3313,11 @@ mod tests {
             b"/build/workspace".to_vec(),
         )];
         let layouts = BTreeSet::from(["INSTA_WORKSPACE_ROOT".to_owned()]);
-        let selected = Prepared::source_trees(
+        let selected = Backend::source_trees(
             &trees,
             cwd,
             [],
-            Prepared::source_environment(&environment, &layouts),
+            Backend::source_environment(&environment, &layouts),
         );
         assert_eq!(selected.len(), 1);
         trees.insert(
@@ -2933,21 +3325,21 @@ mod tests {
             PathBuf::from("workspace-v2"),
         );
         assert_eq!(
-            Prepared::source_trees(
+            Backend::source_trees(
                 &trees,
                 cwd,
                 [],
-                Prepared::source_environment(&environment, &layouts),
+                Backend::source_environment(&environment, &layouts),
             ),
             selected,
         );
         environment.push((b"DATA_ROOT".to_vec(), b"/build/workspace".to_vec()));
         assert_eq!(
-            Prepared::source_trees(
+            Backend::source_trees(
                 &trees,
                 cwd,
                 [],
-                Prepared::source_environment(&environment, &layouts),
+                Backend::source_environment(&environment, &layouts),
             ),
             trees,
         );
@@ -2976,7 +3368,7 @@ mod tests {
             b"\xff/build/external/\xfe",
             b"/build//external/data",
         ] {
-            let selected = Prepared::source_trees(&trees, cwd, [value], []);
+            let selected = Backend::source_trees(&trees, cwd, [value], []);
             assert_eq!(selected.len(), 2, "reference: {value:?}");
             assert_eq!(
                 selected.get(Path::new("/build/external")),
@@ -2993,7 +3385,7 @@ mod tests {
             b"RESOURCE_ROOT".as_slice(),
             b"/build/external/assets".as_slice(),
         )];
-        let selected = Prepared::source_trees(
+        let selected = Backend::source_trees(
             &trees,
             cwd,
             arguments.iter().map(|value| value.as_bytes()),
@@ -3014,7 +3406,7 @@ mod tests {
         .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
         .into();
         let cwd = Path::new("/build/workspace");
-        let selected = Prepared::source_trees(
+        let selected = Backend::source_trees(
             &trees,
             cwd,
             [b"/build/external/pkg-other/src/lib.rs".as_slice()],
@@ -3023,7 +3415,7 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert!(!selected.contains_key(Path::new("/build/external/pkg")));
         for value in [b"BASE=/build/external".as_slice(), b"BASE=/build/external/"] {
-            let selected = Prepared::source_trees(&trees, cwd, [value], []);
+            let selected = Backend::source_trees(&trees, cwd, [value], []);
             assert_eq!(selected.len(), 3, "ancestor: {value:?}");
             assert!(!selected.contains_key(Path::new("/build/elsewhere")));
         }
@@ -3043,7 +3435,7 @@ mod tests {
                 PathBuf::from("unrelated-input"),
             ),
         ]);
-        let selected = Prepared::source_trees(
+        let selected = Backend::source_trees(
             &trees,
             Path::new("/build/workspace"),
             [b"--data=/build/external =\xff/file".as_slice()],
@@ -3069,15 +3461,12 @@ mod tests {
             b"/build/./external",
         ] {
             assert_eq!(
-                Prepared::source_trees(&trees, Path::new("/build/workspace"), [value], []),
+                Backend::source_trees(&trees, Path::new("/build/workspace"), [value], []),
                 trees
             );
         }
         for cwd in ["/build/mirror", "/build/target/generated", "/build"] {
-            assert_eq!(
-                Prepared::source_trees(&trees, Path::new(cwd), [], []),
-                trees
-            );
+            assert_eq!(Backend::source_trees(&trees, Path::new(cwd), [], []), trees);
         }
     }
 
@@ -3096,7 +3485,7 @@ mod tests {
         .map(|(root, input)| (PathBuf::from(root), PathBuf::from(input)))
         .into();
         let selected =
-            Prepared::source_trees(&trees, Path::new("/build/workspace/nested/src"), [], []);
+            Backend::source_trees(&trees, Path::new("/build/workspace/nested/src"), [], []);
         assert_eq!(selected.len(), 4);
         assert_eq!(
             selected.get(Path::new("/build/workspace/target/generated")),
@@ -3127,22 +3516,22 @@ mod tests {
                 .into_iter()
                 .map(|path| {
                     let nar = store::source_nar(path).unwrap();
-                    (path.to_path_buf(), PathBuf::from(Prepared::digest(&nar)))
+                    (path.to_path_buf(), PathBuf::from(Backend::digest(&nar)))
                 })
                 .collect::<BTreeMap<_, _>>()
         };
-        let before = Prepared::source_trees(&snapshot(), &owner, [], []);
+        let before = Backend::source_trees(&snapshot(), &owner, [], []);
         fs::write(unrelated.join("lib.rs"), b"second").unwrap();
-        assert_eq!(Prepared::source_trees(&snapshot(), &owner, [], []), before);
+        assert_eq!(Backend::source_trees(&snapshot(), &owner, [], []), before);
         // A non-Rust asset, absent from Cargo/dep-info, still owns the request.
         fs::write(owner.join("assets/proc-macro-data"), b"second").unwrap();
-        let changed = Prepared::source_trees(&snapshot(), &owner, [], []);
+        let changed = Backend::source_trees(&snapshot(), &owner, [], []);
         assert_ne!(changed, before);
         let referenced =
-            Prepared::source_trees(&snapshot(), &owner, [unrelated.as_os_str().as_bytes()], []);
+            Backend::source_trees(&snapshot(), &owner, [unrelated.as_os_str().as_bytes()], []);
         fs::write(unrelated.join("lib.rs"), b"third").unwrap();
         assert_ne!(
-            Prepared::source_trees(&snapshot(), &owner, [unrelated.as_os_str().as_bytes()], []),
+            Backend::source_trees(&snapshot(), &owner, [unrelated.as_os_str().as_bytes()], []),
             referenced
         );
         fs::remove_dir_all(root).unwrap();
@@ -3151,10 +3540,10 @@ mod tests {
     #[test]
     fn maturin_cfg_is_a_probe_but_compilation_is_not() {
         let args = ["--print", "cfg", "--target", "x86_64-unknown-linux-gnu"].map(OsString::from);
-        assert!(Prepared::is_probe(OsStr::new("rustc"), &args));
+        assert!(Backend::is_probe(OsStr::new("rustc"), &args));
         let mut compilation = args.to_vec();
         compilation.push("input.rs".into());
-        assert!(!Prepared::is_probe(OsStr::new("rustc"), &compilation));
+        assert!(!Backend::is_probe(OsStr::new("rustc"), &compilation));
     }
 
     #[test]
@@ -3188,7 +3577,7 @@ mod tests {
         ));
         invocation.private_target = true;
         let private = serde_json::to_vec(&invocation).unwrap();
-        assert_ne!(Prepared::digest(&copying), Prepared::digest(&private));
+        assert_ne!(Backend::digest(&copying), Backend::digest(&private));
         assert!(
             serde_json::from_slice::<Invocation>(&private)
                 .unwrap()
@@ -3216,7 +3605,7 @@ mod tests {
 
     #[test]
     fn metadata_reference_scan_retains_declared_bare_hashes_and_colliding_names() {
-        let path = |name: &str| Prepared::store_path(Path::new(name)).unwrap();
+        let path = |name: &str| Backend::store_path(Path::new(name)).unwrap();
         let first = path("/nix/store/00000000000000000000000000000000-first");
         let same_hash = path("/nix/store/00000000000000000000000000000000-second");
         let absent = path("/nix/store/11111111111111111111111111111111-absent");
@@ -3226,7 +3615,7 @@ mod tests {
         bytes.push(0);
         bytes.extend_from_slice(b"111111111111111111111111111111");
         assert_eq!(
-            Prepared::metadata_references(&bytes, candidates),
+            Backend::metadata_references(&bytes, candidates),
             BTreeSet::from([first, same_hash])
         );
     }
@@ -3243,7 +3632,7 @@ mod tests {
         ));
         let target = root.join("target");
         fs::create_dir_all(target.join(".dyndrv-delivered")).unwrap();
-        let mut backend = Prepared {
+        let mut backend = Backend {
             config: Config {
                 nix: PathBuf::new(),
                 socket: PathBuf::new(),
@@ -3266,8 +3655,7 @@ mod tests {
                 private_target: false,
                 jobserver_socket_directory: None,
             },
-            trees: BTreeMap::new(),
-            builder_store: PathBuf::new(),
+            compiler_inputs: None,
         };
         let names = [
             "libleaf.rmeta",
@@ -3313,9 +3701,10 @@ mod tests {
         ] {
             fs::create_dir_all(backend.physical(input).unwrap()).unwrap();
         }
-        backend
-            .trees
-            .insert(declared.clone(), current_source.clone());
+        backend.compiler_inputs = Some(CompilerInputs {
+            trees: BTreeMap::from([(declared.clone(), current_source.clone())]),
+            builder_store: PathBuf::from(env!("BUILD_WRAP")),
+        });
         fs::create_dir(backend.physical(&old_source).unwrap().join("data")).unwrap();
         fs::create_dir(backend.physical(&old_generated).unwrap().join("nested")).unwrap();
         let sources = BTreeMap::from([
@@ -3536,7 +3925,7 @@ mod tests {
     #[test]
     fn linked_outputs_require_complete_dependencies() {
         let links = |args: &[&str]| {
-            Prepared::links_dependencies(&args.iter().map(OsString::from).collect::<Vec<_>>())
+            Backend::links_dependencies(&args.iter().map(OsString::from).collect::<Vec<_>>())
         };
         assert!(!links(&[
             "--crate-type=lib",
@@ -3568,7 +3957,7 @@ mod tests {
         ));
         let target = root.join("target");
         fs::create_dir_all(target.join(".dyndrv-delivered")).unwrap();
-        let backend = Prepared {
+        let backend = Backend {
             config: Config {
                 nix: PathBuf::new(),
                 socket: PathBuf::new(),
@@ -3591,8 +3980,7 @@ mod tests {
                 private_target: false,
                 jobserver_socket_directory: None,
             },
-            trees: BTreeMap::new(),
-            builder_store: PathBuf::new(),
+            compiler_inputs: None,
         };
         let immutable_root = Path::new("/nix/store/00000000000000000000000000000000-fixture");
         let mut inputs = BTreeMap::new();
@@ -3731,7 +4119,7 @@ mod tests {
     #[test]
     fn only_noncompiling_queries_bypass_the_builder() {
         let probe = |args: &[&str]| {
-            Prepared::is_probe(
+            Backend::is_probe(
                 OsStr::new("rustc"),
                 &args.iter().map(OsString::from).collect::<Vec<_>>(),
             )
@@ -3763,7 +4151,7 @@ mod tests {
     #[test]
     fn clippy_queries_require_the_literal_rustc_driver_chain() {
         let probe = |program: &str, args: &[&str]| {
-            Prepared::is_probe(
+            Backend::is_probe(
                 OsStr::new(program),
                 &args.iter().map(OsString::from).collect::<Vec<_>>(),
             )
@@ -3796,14 +4184,14 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "head -c 131072 /dev/zero >&2; cat"]);
         let result =
-            Prepared::compiler_output(&mut command, Some(input.clone()), |_| Ok(())).unwrap();
+            Backend::compiler_output(&mut command, Some(input.clone()), |_| Ok(())).unwrap();
         assert!(result.status.success());
         assert_eq!(result.stdout, input);
         assert_eq!(result.stderr, vec![0; 131_072]);
         let mut early_exit = Command::new("/bin/sh");
         early_exit.args(["-c", "exit 23"]);
         let result =
-            Prepared::compiler_output(&mut early_exit, Some(vec![0; 1_048_576]), |_| Ok(()))
+            Backend::compiler_output(&mut early_exit, Some(vec![0; 1_048_576]), |_| Ok(()))
                 .unwrap();
         assert_eq!(result.status.code(), Some(23));
     }

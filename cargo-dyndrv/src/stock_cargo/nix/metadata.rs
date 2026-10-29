@@ -1,5 +1,5 @@
 //! Bounded, integrity-checked metadata delivery over stock Nix build logs.
-use super::{CompilerOutput, Prepared};
+use super::{Backend, CompilerOutput};
 use color_eyre::eyre::{self, bail};
 use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ impl Artifact {
             bail!("metadata notification lacks artifact path")
         };
         let path = PathBuf::from(path);
-        Prepared::scratch(&path)?;
+        Backend::scratch(&path)?;
         if !matches!(output, CompilerOutput::Directory(directory) if path.parent() == Some(directory.as_path()))
             || path
                 .extension()
@@ -73,7 +73,7 @@ impl Artifact {
             &Frame::Start {
                 path,
                 size,
-                digest: Prepared::digest(&bytes),
+                digest: Backend::digest(&bytes),
                 notification: line.to_vec(),
             },
             log,
@@ -160,7 +160,7 @@ impl Receiver {
                 let Some((artifact, size, digest)) = self.pending.take() else {
                     bail!("metadata completion without header")
                 };
-                if artifact.bytes.len() != size || Prepared::digest(&artifact.bytes) != digest {
+                if artifact.bytes.len() != size || Backend::digest(&artifact.bytes) != digest {
                     bail!("incomplete or corrupt metadata payload");
                 }
                 self.complete = true;

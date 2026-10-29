@@ -18,6 +18,8 @@ cargo-dyndrv-worker --bootstrap /absolute/bootstrap \
   --workspace /absolute/checkout --action check -- \
   check --locked --profile dev
 cargo-dyndrv-worker --bootstrap /absolute/bootstrap \
+  --workspace /absolute/checkout --action audit --
+cargo-dyndrv-worker --bootstrap /absolute/bootstrap \
   --workspace /absolute/checkout --action clean --
 ```
 
@@ -105,6 +107,7 @@ incremental state, still determine reuse; no end-to-end speedup is promised.
 owned, mode `0700`, and outside the selected source roots. Workspaces and build
 policies have separate targets and locks; immutable compiler outputs can be shared.
 Failed compiles retain completed dependency outputs and incremental backing.
+Failures invalidate warm retention reuse.
 Interrupted/rejected targets require the explicit `clean` action before reuse.
 
 `CARGO_DYNDRV_STORE` selects `private` or `system`. The optional
@@ -123,6 +126,20 @@ timestamps; secrets, VCS state, build products and virtual environments are
 excluded. Safe selected symlinks are materialized; escaping, ignored and special
 files are rejected before modifying the old stage. Path declarations are rewritten
 for the stable namespace. The worker does not mutate the original manifests.
+Source staging always runs before Cargo, including on warm commands, and compares
+selected contents so changed bytes are staged even when their modification time
+is unchanged. Cargo therefore sees the current staged sources before deciding
+which compilers to invoke.
+
+Compiler source capture and import are deferred until the session's first real,
+non-probe compiler invocation. That invocation freezes the session's compiler
+source map; later compilers share it. A session with no real compiler invocation
+does not prepare compiler inputs. Native build scripts can produce generated
+inputs in `OUT_DIR` or declared generated directories under the target. Writing
+staged source roots from a build script is outside the source contract: a cached
+build script can run before the first compiler captures sources, whereas a cold
+build script must itself be compiled first. Such writes therefore have
+timing-dependent results and must not be used as a source-generation mechanism.
 
 Compiler requests retain their owning source root, dependency source roots and
 declared generated/additional inputs. Procedural macros can read their dependency
@@ -143,14 +160,52 @@ syntax, mounted directory identity and daemon validity before reusing that
 immutable input. Subdirectories, including packages within Git checkouts, retain
 the existing content snapshot/import path. Namespace mounts remain read-only;
 mutable trees are never cached by modification time.
-Prepared NAR images are hashed in full on every invocation. If the corresponding
-content-addressed source path is already registered, the driver reuses it instead
-of transferring and importing the same image again. Source identities and byte
-validation remain unchanged.
-Artifact snapshots reuse each parsed receipt and deduplicate exact immutable
-backing-path checks within that snapshot. Every mutable owned artifact still
-receives a full byte comparison, and incremental backing validation is unchanged.
-No receipt or artifact-validity cache persists across commands.
+Prepared NAR images are hashed in full during compiler input preparation. If the
+corresponding content-addressed source path is already registered, the driver
+reuses it instead of transferring and importing the same image again. Source
+identities and byte validation remain unchanged.
+
+== Retention and auditing
+
+Successful warm commands reuse established GC roots by default when the current
+`cargo-result.json` is version 2, has successful raw `status = 0`, and records
+`nix_invocations = 0`. The count must be a nonnegative integer and counts real,
+non-probe Nix compiler observations, including completed negative compiler
+invocations whose failure a build script accepts. Native rustdoc and native
+compiler probes do not count. Missing, older or malformed completion evidence
+cannot authorize warm reuse.
+
+Reuse also requires the policy's private `retention.json` checkpoint to match
+the target, `.dyndrv-delivered` and GC roots directories: their paths, device/inode
+identities, ownership, mode and modification/change times. Directory-entry changes
+conservatively force reconciliation; runtime-owned file contents may still change.
+The checkpoint records a
+successful full snapshot and retention; it does not certify every descendant's
+current bytes. A first command, restored target, missing checkpoint, replaced
+directory or changed roots directory requires full snapshot and retention.
+Any real compiler invocation or nonempty `post_commands` list for the current
+action also requires the full path. Failures invalidate the checkpoint;
+interrupted ownership retention still requires `clean`. Clean removes the
+checkpoint along with that policy's target and roots. Arbitrary out-of-band
+receipt or root rewrites are outside the supported worker ownership contract;
+the checkpoint's metadata does not prove descendant payloads are unchanged.
+
+Compiler ownership checks remain in force when artifacts are consumed or
+replaced. An unchanged warm command does not automatically scan unused artifacts
+or incremental state for corruption. Use `--action audit --` to request that full
+check explicitly. Audit requires the current stored session to have completed
+successfully and runs under the workspace lock and daemon lease. It takes a full
+snapshot and conservatively unions the discovered references with the existing
+GC roots, without pruning them. It performs no source or compiler preparation and
+does not realize absent backing outputs. The driver's direct
+`snapshot-references` command retains its full validation semantics; audit uses
+that same operation.
+
+Full artifact snapshots reuse each parsed receipt and deduplicate exact immutable
+backing-path checks within that snapshot. Every mutable owned artifact receives
+a full byte comparison, and incremental backing validation is unchanged. Parsed
+receipts and artifact-validity results are not cached across snapshots; the
+worker checkpoint only permits skipping the snapshot on eligible warm commands.
 With `system-store-rlib-links`, eligible owned links are checked for exact backing,
 representation and protected-store identity instead of rereading their payloads.
 Receipt completion, transitive owners and GC roots remain required. Replacing a
@@ -159,6 +214,25 @@ builder-dependency and incremental validation retain their existing checks.
 Generated inputs still reject symlinks; explicitly capturing a linked `deps`
 directory through a native library search path is outside this experimental
 policy. Backups of its target must preserve symlinks.
+
+== Session evidence
+
+`session.json` version 2 preserves the `.nix.config` object for Nix sessions.
+Compiler lifecycle data is separate: `compiler-inputs.json` contains the frozen
+source trees and builder input after the first real compiler prepares them. This
+file is optional: it is absent when no compiler preparation was needed or when
+preparation did not complete. Readers of session configuration must not assume
+compiler preparation occurred or look for its fields inside `.nix`.
+`cargo-result.json` version 2 contains `version`, `status` and `nix_invocations`;
+`status` retains the existing raw process wait status, not a decoded exit code.
+
+Successful `last-run.json` records include `action`, `nix_invocations` from that
+completion and `ownership_validation = "full"` or `"retained"`. The worker's
+`status` is its command exit code, unlike the raw wait status in
+`cargo-result.json`. A retained run omits `snapshot_references` and `retain` from
+`phase_seconds`; runtime provisioning still runs. Audit records `action = "audit"`
+and `ownership_validation = "full"` using the prior successful session and its
+compiler count. Its timings describe the audit, not another Cargo execution.
 
 Staged commands record `last-run.json` once their workspace target passes the
 interrupted-command check. Failures before this point, including initial metadata

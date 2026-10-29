@@ -916,6 +916,125 @@ class Worker:
                 + self.mapped_command(layout["roots"]),
             )
 
+    def _retention_identity(self, target, owner):
+        # This checkpoint establishes retention, not continued payload integrity.
+        # Directory metadata catches replacement and root-set changes without
+        # reading receipts or hashing compiler/runtime-owned file contents.
+        identity = {}
+        for name, path in (
+            ("target", target),
+            ("ownership", target / ".dyndrv-delivered"),
+            ("roots", self.state / "roots" / owner),
+        ):
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                return None
+            identity[name] = {
+                "path": str(path),
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "mode": info.st_mode,
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "mtime_ns": info.st_mtime_ns,
+                "ctime_ns": info.st_ctime_ns,
+            }
+        return {"version": 1, **identity}
+
+    @staticmethod
+    def completed_invocations(session):
+        try:
+            completion = json.loads((session / "cargo-result.json").read_text())
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                "dyndrv requires a successful v2 Cargo completion"
+            ) from error
+        if (
+            not isinstance(completion, dict)
+            or type(completion.get("version")) is not int
+            or completion["version"] != 2
+            or type(completion.get("status")) is not int
+            or completion["status"] != 0
+            or type(completion.get("nix_invocations")) is not int
+            or completion["nix_invocations"] < 0
+        ):
+            raise ValueError("dyndrv requires a successful v2 Cargo completion")
+        return completion["nix_invocations"]
+
+    def snapshot_references(self, namespace_config, session, timings):
+        references = namespace_config.parent / (
+            "references-" + uuid.uuid4().hex + ".json"
+        )
+        with timings.phase("snapshot_references"):
+            self.run_namespace(
+                namespace_config,
+                [
+                    self.spec["driver"],
+                    "snapshot-references",
+                    "--directory",
+                    str(session),
+                    "--output",
+                    str(references),
+                ],
+            )
+            return set(json.loads(references.read_text())["storePaths"])
+
+    def audit(self, directory, owner, workspace_lock, timings):
+        checkpoint = directory / "retention.json"
+        checkpoint.unlink(missing_ok=True)
+        try:
+            previous = json.loads((directory / "last-run.json").read_text())
+            session = Path(previous["session"])
+            if previous["status"] != 0 or session.parent != directory / "sessions":
+                raise ValueError("no successful current session")
+            invocations = self.completed_invocations(session)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise ValueError(
+                "dyndrv audit requires a successful prior session"
+            ) from error
+        target = directory / "stage/target"
+        if not target.is_dir():
+            raise ValueError(
+                "dyndrv audit requires the successful session's retained target"
+            )
+        record = {
+            **previous,
+            "action": "audit",
+            "status": 1,
+            "nix_invocations": invocations,
+        }
+        for name in (
+            "seconds",
+            "total_seconds",
+            "phase_seconds",
+            "ownership_validation",
+        ):
+            record.pop(name, None)
+        timings.execution_started = time.monotonic()
+        try:
+            with self.daemon.lease() as lease:
+                self.lock_fds = (workspace_lock.fileno(), lease.fileno())
+                references = self.snapshot_references(
+                    directory / "namespace.json", session, timings
+                )
+                with timings.phase("retain"):
+                    # Runtime inputs are not reconstructed by an audit. Preserve
+                    # every existing root, and validate backing before rooting it.
+                    self.daemon.retain(sorted(references), owner)
+                identity = self._retention_identity(target, owner)
+                if identity is not None:
+                    write_json(checkpoint, identity)
+                record.update(status=0, ownership_validation="full")
+        except subprocess.CalledProcessError as error:
+            record["status"] = error.returncode
+            raise
+        finally:
+            timings.write(directory / "last-run.json", record)
+        return 0
+
     def run(self):
         timings = RunTimings()
         actions = {
@@ -927,6 +1046,7 @@ class Worker:
             "list",
             "doc",
             "fmt",
+            "audit",
             "clean",
             "gc",
             "stop",
@@ -957,10 +1077,10 @@ class Worker:
             )
             return
         with timings.phase("original_metadata"):
-            metadata = self.original_metadata(locate=self.action == "clean")
+            metadata = self.original_metadata(locate=self.action in {"clean", "audit"})
         workspace = (
             Path(metadata["root"]).parent
-            if self.action == "clean"
+            if self.action in {"clean", "audit"}
             else Path(metadata["workspace_root"])
         )
         policy = hashlib.sha256(
@@ -986,7 +1106,9 @@ class Worker:
             contextlib.ExitStack() as cleanup,
         ):
             in_progress = directory / "in-progress.json"
+            checkpoint = directory / "retention.json"
             if self.action == "clean":
+                checkpoint.unlink(missing_ok=True)
                 shutil.rmtree(directory / "stage" / "target", ignore_errors=True)
                 shutil.rmtree(self.state / "roots" / owner, ignore_errors=True)
                 record = directory / "installed.json"
@@ -1005,14 +1127,31 @@ class Worker:
                 in_progress.unlink(missing_ok=True)
                 return
             if in_progress.exists():
+                checkpoint.unlink(missing_ok=True)
                 raise ValueError(
                     "dyndrv target has an interrupted command; run the application's dyndrv clean action before retrying"
                 )
             stage = directory / "stage"
             target = stage / "target"
+            if (target / ".dyndrv-delivered/rejected").exists():
+                checkpoint.unlink(missing_ok=True)
+                raise ValueError(
+                    "dyndrv target was rejected; run the application's dyndrv clean action before retrying"
+                )
+            if self.action == "audit":
+                return self.audit(directory, owner, workspace_lock, timings)
+            try:
+                retained = json.loads(checkpoint.read_text())
+            except (OSError, ValueError):
+                retained = None
+            if retained != self._retention_identity(target, owner):
+                retained = None
+            # Any failed attempt must reconcile before it can reuse retention.
+            checkpoint.unlink(missing_ok=True)
             session = directory / "sessions" / uuid.uuid4().hex
             record = {
                 "session": str(session),
+                "action": self.action,
                 "status": 1,
                 "workspace": str(workspace),
                 "target": str(target),
@@ -1079,10 +1218,6 @@ class Worker:
             ):
                 (cargo_home / "config.toml").write_text(merged)
             target.mkdir(exist_ok=True)
-            if (target / ".dyndrv-delivered/rejected").exists():
-                raise ValueError(
-                    "dyndrv target was rejected; run the application's dyndrv clean action before retrying"
-                )
             (stage / "tmp").mkdir(exist_ok=True)
             (stage / "home").mkdir(exist_ok=True)
             self.environment.update(
@@ -1252,30 +1387,28 @@ class Worker:
                 try:
                     with timings.phase("driver"):
                         self.run_namespace(namespace_config, command)
+                    invocations = self.completed_invocations(session)
+                    record["nix_invocations"] = invocations
                     with timings.phase("post_commands"):
                         self.run_post_commands(namespace_config, layout)
-                    references = directory / ("references-" + session.name + ".json")
-                    with timings.phase("snapshot_references"):
-                        self.run_namespace(
-                            namespace_config,
-                            [
-                                self.spec["driver"],
-                                "snapshot-references",
-                                "--directory",
-                                str(session),
-                                "--output",
-                                str(references),
-                            ],
+                    if (
+                        invocations == 0
+                        and retained is not None
+                        and not self.spec.get("post_commands", {}).get(self.action)
+                        and retained == self._retention_identity(target, owner)
+                    ):
+                        record["ownership_validation"] = "retained"
+                    else:
+                        references = self.snapshot_references(
+                            namespace_config, session, timings
                         )
-                    with timings.phase("retain"):
-                        self.daemon.retain(
-                            sorted(
-                                set(json.loads(references.read_text())["storePaths"])
-                                | set(runtime_inputs)
-                            ),
-                            owner,
-                            replace=True,
-                        )
+                        with timings.phase("retain"):
+                            self.daemon.retain(
+                                sorted(references | set(runtime_inputs)),
+                                owner,
+                                replace=True,
+                            )
+                        record["ownership_validation"] = "full"
                     in_progress.unlink(missing_ok=True)
                     if self.action in {"build", "run"}:
                         with timings.phase("install_binaries"):
@@ -1335,6 +1468,9 @@ class Worker:
                     if reports.exists():
                         destination = workspace / "target/test-reports/dyndrv"
                         shutil.copytree(reports, destination, dirs_exist_ok=True)
+                identity = self._retention_identity(target, owner)
+                if identity is not None:
+                    write_json(checkpoint, identity)
             return 0
 
 

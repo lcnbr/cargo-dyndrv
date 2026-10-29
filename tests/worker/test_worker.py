@@ -1,5 +1,6 @@
 """Private worker lifecycle regressions, without starting Nix or compiling."""
 
+import contextlib
 import json
 import os
 import select
@@ -439,6 +440,10 @@ class ArtifactDeliveryTests(unittest.TestCase):
                     worker.write_json(Path(command[-1]), {"storePaths": []})
                 else:
                     self.assertEqual(command[1], "nix-cargo")
+                    worker.write_json(
+                        Path(command[3]) / "cargo-result.json",
+                        {"version": 2, "status": 0, "nix_invocations": 0},
+                    )
                     backend = json.loads((config.parent / "backend.json").read_text())
                     self.assertEqual(backend.pop("artifact_delivery"), policy)
                     roots = Path(backend.pop("gc_roots"))
@@ -467,6 +472,337 @@ class ArtifactDeliveryTests(unittest.TestCase):
         self.assertNotEqual(deliveries[0][0], deliveries[1][0])
         self.assertEqual(deliveries[0][1:], deliveries[1][1:])
         self.assertEqual(deliveries[0], deliveries[2])
+
+
+class WorkerRetentionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="dyndrv-retention-")
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.bootstrap = self.directory / "bootstrap"
+        self.bootstrap.mkdir()
+        (self.bootstrap / "environment.json").write_text("{}")
+        self.workspace = self.directory / "workspace"
+        self.workspace.mkdir()
+        self.state = self.directory / "state"
+        self.daemon = mock.Mock(
+            mode="system",
+            state=self.state,
+            store_root=Path("/"),
+            socket=Path("/daemon/socket"),
+        )
+
+        @contextlib.contextmanager
+        def lease():
+            with worker.locked(self.state / "test-lease") as stream:
+                yield stream
+
+        self.daemon.lease.side_effect = lease
+        self.daemon.retain.side_effect = self.retain
+        self.daemon.provision.side_effect = lambda paths, owner: self.retain(
+            paths, owner
+        )
+        self.metadata = self.enterContext(
+            mock.patch.object(worker.Worker, "original_metadata")
+        )
+        self.metadata.side_effect = lambda **kwargs: {
+            "workspace_root": str(self.workspace),
+            "root": str(self.workspace / "Cargo.toml"),
+        }
+        self.vendor = self.enterContext(
+            mock.patch.object(
+                worker.Worker, "vendor_input", return_value=Path("/nix/store/vendor")
+            )
+        )
+        self.enterContext(
+            mock.patch.object(worker.Worker, "vendor_layout", return_value=({}, []))
+        )
+        self.sources = self.enterContext(mock.patch.object(worker, "SourceLayout"))
+        self.sources.return_value.prepare.return_value = {
+            "workspace": "/logical/workspace",
+            "roots": [],
+            "package_sources": ["/logical/workspace"],
+        }
+        self.namespace = self.enterContext(
+            mock.patch.object(worker.Worker, "run_namespace")
+        )
+        self.namespace.side_effect = self.execute
+        self.enterContext(
+            mock.patch.dict(
+                os.environ, {"CARGO_HOME": str(self.directory / "home")}, clear=True
+            )
+        )
+        self.completion = {"version": 2, "status": 0, "nix_invocations": 0}
+        self.driver_failure = None
+        self.during_driver = lambda: None
+        self.snapshot_failure = None
+        self.snapshots = 0
+        self.hooks = {}
+        self.extra_runtime = {}
+
+    def retain(self, references, owner, *, replace=False):
+        roots = self.state / "roots" / owner
+        roots.mkdir(parents=True, exist_ok=True, mode=0o700)
+        names = set()
+        for reference in references:
+            root = roots / Path(reference).name
+            names.add(root.name)
+            if not root.is_symlink():
+                root.symlink_to(reference)
+        if replace:
+            for root in roots.iterdir():
+                if root.name not in names:
+                    root.unlink()
+
+    def execute(self, config, command, **kwargs):
+        if command[1] == "metadata":
+            return json.dumps({"packages": []})
+        if command[1] == "snapshot-references":
+            self.snapshots += 1
+            for lock in (config.parent / "workspace.lock", self.state / "test-lease"):
+                with (
+                    self.assertRaises(BlockingIOError),
+                    worker.locked(lock, blocking=False),
+                ):
+                    self.fail("snapshot must keep both locks")
+            if self.snapshot_failure:
+                raise self.snapshot_failure
+            worker.write_json(
+                Path(command[-1]), {"storePaths": ["/nix/store/compiler-output"]}
+            )
+        elif command[1] == "nix-cargo":
+            target = config.parent / "stage/target"
+            (target / ".dyndrv-delivered").mkdir(exist_ok=True)
+            self.during_driver()
+            if self.completion is not None:
+                worker.write_json(
+                    Path(command[3]) / "cargo-result.json", self.completion
+                )
+            if self.driver_failure:
+                raise self.driver_failure
+        else:
+            self.assertEqual(command[0], "post-hook")
+
+    def run_worker(self, action="check"):
+        runner = worker.Worker.__new__(worker.Worker)
+        runner.bootstrap = self.bootstrap
+        runner.workspace = self.workspace
+        runner.state = self.state
+        runner.daemon = self.daemon
+        runner.logical = Path("/logical")
+        runner.action = action
+        runner.arguments = [action] if action not in {"clean", "audit"} else []
+        runner.spec = {
+            "environment": {},
+            "runtime_path": "/tools",
+            "cargo": "/tools/cargo",
+            "driver": "/tools/driver",
+            "rustdoc": "/tools/rustdoc",
+            "nix": "/tools/nix",
+            "inputs": ["/nix/store/compiler-input"],
+            "post_commands": self.hooks,
+        }
+        runner.environment = dict(self.extra_runtime)
+        runner.workspace_names = runner.layout_names = runner.runtime_names = (
+            runner.private_names
+        ) = set()
+        runner.runtime_prefixes = ()
+        runner.source_overlay = False
+        runner.artifact_delivery = "copy"
+        return runner.run()
+
+    @property
+    def policy(self):
+        return next((self.state / "workspaces").glob("*/*"))
+
+    @property
+    def report(self):
+        return json.loads((self.policy / "last-run.json").read_text())
+
+    @property
+    def checkpoint(self):
+        return self.policy / "retention.json"
+
+    def test_first_command_reconciles_then_warm_reuse_preserves_existing_roots(self):
+        def create_runtime():
+            (self.policy / "stage/target/runtime").write_text(str(self.snapshots))
+
+        self.during_driver = create_runtime
+        self.run_worker()
+        self.assertEqual(self.report["ownership_validation"], "full")
+        roots = next((self.state / "roots").glob("*/*"))
+        before = {path.name: path.lstat() for path in roots.iterdir()}
+        self.daemon.retain.reset_mock()
+        self.run_worker()
+        self.assertEqual(self.snapshots, 1)
+        self.assertEqual(self.report["ownership_validation"], "retained")
+        self.assertEqual(self.report["nix_invocations"], 0)
+        self.assertNotIn("snapshot_references", self.report["phase_seconds"])
+        self.assertNotIn("retain", self.report["phase_seconds"])
+        self.daemon.retain.assert_not_called()
+        self.assertEqual(before, {path.name: path.lstat() for path in roots.iterdir()})
+        self.assertEqual(self.sources.return_value.prepare.call_count, 2)
+        self.assertEqual(self.daemon.provision.call_count, 2)
+
+    def test_real_invocations_without_final_results_and_hooks_require_full_audit(self):
+        self.run_worker()
+        # Completed negative compilers have no successful final result to scan.
+        self.completion["nix_invocations"] = 1
+        self.run_worker()
+        self.assertEqual(self.report["ownership_validation"], "full")
+        self.completion["nix_invocations"] = 0
+        self.hooks["check"] = [["post-hook", "argument"]]
+        self.run_worker()
+        self.assertEqual(self.snapshots, 3)
+        self.hooks.clear()
+        self.hooks["test"] = [["post-hook", "argument"]]
+        self.run_worker()
+        self.assertEqual(self.report["ownership_validation"], "retained")
+
+    def test_missing_or_malformed_completion_never_reuses_retention(self):
+        for completion in (
+            None,
+            {},
+            {"version": 1, "status": 0, "nix_invocations": 0},
+            *(
+                {"version": 2, "status": 0, "nix_invocations": value}
+                for value in (-1, True, 0.0, None)
+            ),
+            {"version": 2, "status": 256, "nix_invocations": 1},
+        ):
+            with self.subTest(completion=completion):
+                self.run_worker("clean")
+                self.completion = {"version": 2, "status": 0, "nix_invocations": 0}
+                self.run_worker()
+                self.completion = completion
+                with self.assertRaisesRegex(
+                    ValueError, "successful v2 Cargo completion"
+                ):
+                    self.run_worker()
+                self.assertFalse(self.checkpoint.exists())
+                self.assertNotEqual(self.report["status"], 0)
+                with self.assertRaisesRegex(ValueError, "interrupted"):
+                    self.run_worker("audit")
+
+    def test_missing_checkpoint_replaced_directories_and_root_changes_reconcile(self):
+        for name in (
+            "checkpoint",
+            "target",
+            "ownership",
+            "roots",
+            "missing_root",
+            "missing_roots",
+            "added_runtime",
+        ):
+            with self.subTest(name=name):
+                self.run_worker()
+                before = self.snapshots
+                identity = json.loads(self.checkpoint.read_text())
+                if name == "checkpoint":
+                    self.checkpoint.unlink()
+                elif name == "missing_root":
+                    (Path(identity["roots"]["path"]) / "compiler-output").unlink()
+                elif name == "missing_roots":
+                    shutil.rmtree(Path(identity["roots"]["path"]))
+                elif name == "added_runtime":
+                    self.extra_runtime["RUNTIME_INPUT"] = (
+                        "/nix/store/" + "a" * 32 + "-extra"
+                    )
+                else:
+                    path = Path(identity[name]["path"])
+                    saved = path.with_name(path.name + "-saved")
+                    path.rename(saved)
+                    shutil.copytree(saved, path, symlinks=True)
+                    shutil.rmtree(saved)
+                self.run_worker()
+                self.assertEqual(self.snapshots, before + 1)
+                self.assertEqual(self.report["ownership_validation"], "full")
+
+    def test_identity_change_during_delivery_free_command_requires_full_audit(self):
+        self.run_worker()
+        roots = Path(json.loads(self.checkpoint.read_text())["roots"]["path"])
+        self.during_driver = lambda: (roots / "compiler-output").unlink()
+        self.run_worker()
+        self.assertEqual(self.snapshots, 2)
+
+    def test_failure_invalidates_checkpoint_and_retains_backing_then_clean_removes_it(
+        self,
+    ):
+        self.run_worker()
+        self.driver_failure = subprocess.CalledProcessError(17, "driver")
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            self.run_worker()
+        self.assertEqual(failure.exception.returncode, 17)
+        self.assertFalse(self.checkpoint.exists())
+        self.assertFalse((self.policy / "in-progress.json").exists())
+        self.daemon.retain.assert_called_with(set(), "/".join(self.policy.parts[-2:]))
+        with self.assertRaisesRegex(ValueError, "successful prior session"):
+            self.run_worker("audit")
+        self.driver_failure = None
+        self.run_worker()
+        self.assertEqual(self.report["ownership_validation"], "full")
+        self.assertEqual(self.snapshots, 2)
+        session = Path(self.report["session"])
+        self.run_worker("clean")
+        self.assertFalse(self.checkpoint.exists())
+        self.assertTrue(session.exists())
+
+    def test_audit_uses_successful_stored_session_without_staging_and_keeps_extra_roots(
+        self,
+    ):
+        self.run_worker()
+        session = self.report["session"]
+        roots = Path(json.loads(self.checkpoint.read_text())["roots"]["path"])
+        (roots / "older-runtime").symlink_to("/nix/store/older-runtime")
+        for operation in (
+            self.namespace,
+            self.metadata,
+            self.vendor,
+            self.sources,
+            self.daemon.provision,
+        ):
+            operation.reset_mock()
+        self.run_worker("audit")
+        self.metadata.assert_called_once_with(locate=True)
+        self.namespace.assert_called_once()
+        self.assertEqual(
+            self.namespace.call_args.args[1][1:4],
+            ["snapshot-references", "--directory", session],
+        )
+        self.vendor.assert_not_called()
+        self.sources.assert_not_called()
+        self.daemon.provision.assert_not_called()
+        self.assertTrue((roots / "older-runtime").is_symlink())
+        self.assertEqual(self.report["action"], "audit")
+        self.assertEqual(self.report["ownership_validation"], "full")
+        self.assertTrue(self.checkpoint.exists())
+        self.assertNotIn("driver", self.report["phase_seconds"])
+
+    def test_unused_corruption_is_left_for_explicit_audit_and_audit_failure_preserves_roots(
+        self,
+    ):
+        self.run_worker()
+        roots = Path(json.loads(self.checkpoint.read_text())["roots"]["path"])
+        before = {path.name: path.lstat() for path in roots.iterdir()}
+        self.snapshot_failure = subprocess.CalledProcessError(2, "corrupt payload")
+        self.run_worker()
+        self.assertEqual(self.report["ownership_validation"], "retained")
+        self.daemon.retain.reset_mock()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_worker("audit")
+        self.assertFalse(self.checkpoint.exists())
+        self.assertEqual(self.report["status"], 2)
+        self.daemon.retain.assert_not_called()
+        self.assertEqual(before, {path.name: path.lstat() for path in roots.iterdir()})
+
+    def test_audit_requires_successful_session_and_refuses_rejected_targets(self):
+        with self.assertRaisesRegex(ValueError, "successful prior session"):
+            self.run_worker("audit")
+        self.run_worker()
+        (self.policy / "stage/target/.dyndrv-delivered/rejected").touch()
+        with self.assertRaisesRegex(ValueError, "target was rejected"):
+            self.run_worker("audit")
+        self.assertFalse(self.checkpoint.exists())
 
 
 class VendorInputTests(unittest.TestCase):
@@ -854,6 +1190,23 @@ class WorkerLifecycleTests(unittest.TestCase):
             system.provision(inputs, "workspace/policy")
         retain.assert_called_once_with(inputs, "workspace/policy")
         execute.assert_not_called()
+
+    def test_retention_rejects_missing_backing_before_realizing_or_pruning(self):
+        roots = self.daemon.state / "roots/workspace/policy"
+        roots.mkdir(parents=True)
+        old = roots / "old-output"
+        old.symlink_to("/nix/store/old-output")
+        missing = "/nix/store/missing-output"
+        with (
+            mock.patch.object(
+                worker, "run", side_effect=subprocess.CalledProcessError(1, "path-info")
+            ) as execute,
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            self.daemon.retain([missing], "workspace/policy", replace=True)
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[0][1], "path-info")
+        self.assertEqual(os.readlink(old), "/nix/store/old-output")
 
     def test_failed_build_retains_artifacts_dependency_sources_and_incremental_state(
         self,

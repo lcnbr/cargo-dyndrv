@@ -1,6 +1,6 @@
 //! Each rustc-selected incremental child is an immutable input/output pair.
 //! Never recover missing local state by requesting its previous producer.
-use super::{CompilerOutput, Prepared};
+use super::{Backend, CompilerOutput};
 use color_eyre::eyre::{self, Context, bail};
 use serde::{Deserialize, Serialize};
 use source_wrap::Verifier;
@@ -60,7 +60,7 @@ impl Products {
         for path in paths {
             let file = File::open(&path)?;
             let info = file.metadata()?;
-            let digest = Prepared::digest(&fs::read(&path)?);
+            let digest = Backend::digest(&fs::read(&path)?);
             files.insert((info.dev(), info.ino()), (file, path, digest));
         }
         Ok(Self {
@@ -78,7 +78,7 @@ impl Products {
             if let Some((_held_file, previous, digest)) = self.files.get(&(info.dev(), info.ino()))
                 && !self.paths.contains(&path)
                 && previous.parent() != path.parent()
-                && *digest == Prepared::digest(&fs::read(&path)?)
+                && *digest == Backend::digest(&fs::read(&path)?)
             {
                 reused.push(serde_json::json!({"before":previous,"after":path,"sha256":digest,"bytes":info.len()}));
             }
@@ -109,12 +109,12 @@ struct Receipt {
 }
 
 impl Receipt {
-    fn read(path: &Path, backend: &Prepared) -> eyre::Result<Self> {
+    fn read(path: &Path, backend: &Backend) -> eyre::Result<Self> {
         if !path.symlink_metadata()?.is_file() {
             bail!("incremental receipt must be regular");
         }
         let receipt: Self = serde_json::from_slice(&fs::read(path)?)?;
-        Prepared::scratch(&receipt.directory)?;
+        Backend::scratch(&receipt.directory)?;
         if receipt.version != 1
             || path.file_name() != Some(OsStr::new(&format!("{}.json", receipt.unit)))
             || !State::valid_child(&receipt.child)
@@ -127,7 +127,7 @@ impl Receipt {
         Ok(receipt)
     }
 
-    fn physical(&self, backend: &Prepared) -> eyre::Result<PathBuf> {
+    fn physical(&self, backend: &Backend) -> eyre::Result<PathBuf> {
         State::validate_input(&self.input)?;
         let physical = backend.physical(&self.input)?;
         if State::produced_child(&physical)?.as_ref() != Some(&self.child) {
@@ -163,7 +163,7 @@ impl State {
         let Some(directory) = directory else {
             return Ok(None);
         };
-        Prepared::scratch(&directory)?;
+        Backend::scratch(&directory)?;
         if !directory.starts_with(target)
             || directory.file_name() != Some(OsStr::new("incremental"))
             || crate::source::resolve_target_directory(&directory)? != directory
@@ -179,7 +179,7 @@ impl State {
         Ok(Some(Self {
             directory,
             input: None,
-            unit: Prepared::digest(&serde_json::to_vec(
+            unit: Backend::digest(&serde_json::to_vec(
                 &args.iter().map(|a| a.as_bytes()).collect::<Vec<_>>(),
             )?),
             child: None,
@@ -187,7 +187,7 @@ impl State {
         }))
     }
 
-    fn receipt(&self, backend: &Prepared) -> PathBuf {
+    fn receipt(&self, backend: &Backend) -> PathBuf {
         backend
             .config
             .target
@@ -216,8 +216,8 @@ impl State {
     }
 
     fn validate_input(input: &Path) -> eyre::Result<()> {
-        let root = Prepared::store_path(input)?
-            .to_absolute_path(&harmonia_store_path::StoreDir::default());
+        let root =
+            Backend::store_path(input)?.to_absolute_path(&harmonia_store_path::StoreDir::default());
         if input != root.join("incremental") {
             bail!("incremental input must belong to a compiler result");
         }
@@ -259,7 +259,7 @@ impl State {
 
     /// Hold this lock through compiler completion and host delivery. Cargo normally
     /// serializes the unit; reject accidental concurrent owners instead of waiting.
-    pub(super) fn bind(&mut self, backend: &Prepared) -> eyre::Result<File> {
+    pub(super) fn bind(&mut self, backend: &Backend) -> eyre::Result<File> {
         let receipt = self.receipt(backend);
         let parent = receipt.parent().unwrap();
         fs::create_dir_all(parent)?;
@@ -301,7 +301,7 @@ impl State {
     }
 
     pub(super) fn snapshot_references(
-        backend: &Prepared,
+        backend: &Backend,
         verifier: &mut Verifier,
     ) -> eyre::Result<(BTreeSet<PathBuf>, usize, Vec<File>)> {
         let directory = backend.config.target.join(".dyndrv-delivered/incremental");
@@ -356,7 +356,7 @@ impl State {
             // including after a deliberate strip. Export must retain that input
             // or fail; this operation never requests a producer to recover it.
             references.insert(
-                Prepared::store_path(&prior.input)?
+                Backend::store_path(&prior.input)?
                     .to_absolute_path(&harmonia_store_path::StoreDir::default()),
             );
         }
@@ -390,7 +390,7 @@ impl State {
         Ok(())
     }
 
-    pub(super) fn deliver(&self, backend: &Prepared, output: &Path) -> eyre::Result<()> {
+    pub(super) fn deliver(&self, backend: &Backend, output: &Path) -> eyre::Result<()> {
         let input = output.join("incremental");
         let physical = backend.physical(&input)?;
         let Some(child) = Self::produced_child(&physical)? else {
@@ -441,7 +441,7 @@ impl State {
         }
         let receipt = self.receipt(backend);
         let temporary = receipt.with_extension(format!("{}.tmp", std::process::id()));
-        Prepared::write_json(
+        Backend::write_json(
             &temporary,
             &Receipt {
                 version: 1,
@@ -564,7 +564,7 @@ mod tests {
         let root = root();
         let target = root.join("target");
         fs::create_dir(&target).unwrap();
-        let backend = Prepared {
+        let backend = Backend {
             config: Config {
                 nix: PathBuf::new(),
                 socket: PathBuf::new(),
@@ -587,8 +587,7 @@ mod tests {
                 environment_prefixes: Vec::new(),
                 omitted_environment_names: BTreeSet::new(),
             },
-            trees: BTreeMap::new(),
-            builder_store: PathBuf::new(),
+            compiler_inputs: None,
         };
         let directory = target.join("ci/incremental");
         let output = Path::new("/nix/store/00000000000000000000000000000000-result");
