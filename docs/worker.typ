@@ -215,6 +215,15 @@ Generated inputs still reject symlinks; explicitly capturing a linked `deps`
 directory through a native library search path is outside this experimental
 policy. Backups of its target must preserve symlinks.
 
+Linked archives expose the Nix store's fixed timestamp. Their copied metadata
+must record each compiler invocation even when its bytes are unchanged, as with
+a native-only implementation change. Link delivery refreshes metadata before
+announcing readiness to Cargo and preserves that timestamp at completion; a
+cached result without early metadata refreshes it during final delivery. This
+keeps rebuilt dependencies visible to Cargo without dirtying consumers that
+already started through pipelining. Copy delivery retains its existing
+equal-content metadata reuse.
+
 == Session evidence
 
 `session.json` version 2 preserves the `.nix.config` object for Nix sessions.
@@ -272,6 +281,7 @@ python3 tests/worker/test_macro_sources.py --bootstrap /absolute/bootstrap
 python3 tests/worker/test_incremental.py --bootstrap /absolute/bootstrap
 python3 tests/worker/test_system.py --bootstrap /absolute/bootstrap --second-user USER
 python3 tests/worker/test_artifact_links.py --bootstrap /absolute/rlib-link-bootstrap
+python3 tests/worker/test_native_freshness.py --bootstrap /absolute/bootstrap
 ```
 
 They cover source relocation, runtime identity and credentials, fresh test
@@ -284,6 +294,11 @@ The artifact-link suite requires the explicit `system-store-rlib-links` bootstra
 and the configured system daemon. It covers Cargo freshness, repeated runtime
 tests, dependency edits, target restoration, link tampering and failure recovery;
 it never collects or stops the shared store.
+
+The native-freshness suite accepts either copy or link delivery against the
+system daemon. It changes bundled C code while preserving Rust metadata bytes,
+builds the dependency separately, and checks the consumer's output and subsequent
+warm reuse.
 
 Evidence directories retain logs and isolated fixtures for review; owned
 private daemons stop on completion or failure. `workload.py` is a test fixture

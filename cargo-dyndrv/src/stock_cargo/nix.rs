@@ -1334,7 +1334,14 @@ impl Backend {
         drop(staged);
         let result = async {
             let owner = self.metadata_owner(daemon, &temporary, invocation).await?;
-            if target.try_exists()? && fs::read(target)? == artifact.bytes {
+            // A linked archive exposes the store's fixed mtime. Refresh its
+            // copied metadata before announcing readiness so Cargo can observe
+            // a rebuild even when only bundled native code changed. Consumers
+            // may start now, so completion must preserve this timestamp.
+            if self.config.artifact_delivery != ArtifactDelivery::SystemStoreRlibLinks
+                && target.try_exists()?
+                && fs::read(target)? == artifact.bytes
+            {
                 fs::remove_file(&temporary)?;
             } else {
                 fs::rename(&temporary, target)?;
@@ -2213,11 +2220,16 @@ impl Backend {
         }
         for (input, target) in &owned {
             if target.extension() == Some(OsStr::new("rmeta"))
+                && (early.contains_key(target)
+                    || delivered.owned.get(&target.with_extension("rlib"))
+                        != Some(&Representation::StoreLink))
                 && target.try_exists()?
                 && same_contents(input, target)?
             {
                 // Early metadata may already have been consumed. Replacing
                 // identical bytes would change mtime and dirty those consumers.
+                // Without early delivery, a linked archive needs fresh metadata
+                // here instead: neither output otherwise records this rebuild.
                 continue;
             }
             delivered.owned[target].publish(input, target, &delivered.files[target])?;
