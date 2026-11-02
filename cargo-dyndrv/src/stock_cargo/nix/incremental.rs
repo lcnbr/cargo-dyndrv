@@ -1,6 +1,6 @@
 //! Each rustc-selected incremental child is an immutable input/output pair.
 //! Never recover missing local state by requesting its previous producer.
-use super::{Backend, CompilerOutput};
+use super::{Backend, CompilerOutput, SnapshotMode};
 use color_eyre::eyre::{self, Context, bail};
 use serde::{Deserialize, Serialize};
 use source_wrap::Verifier;
@@ -303,6 +303,7 @@ impl State {
     pub(super) fn snapshot_references(
         backend: &Backend,
         verifier: &mut Verifier,
+        mode: SnapshotMode,
     ) -> eyre::Result<(BTreeSet<PathBuf>, usize, Vec<File>)> {
         let directory = backend.config.target.join(".dyndrv-delivered/incremental");
         if !directory.try_exists()? {
@@ -346,10 +347,23 @@ impl State {
                 bail!("incremental receipt lacks its coordination lock");
             }
             let prior = Receipt::read(&path, backend)?;
-            let physical = prior.physical(backend)?;
+            let physical = if mode == SnapshotMode::Audit {
+                prior.physical(backend)?
+            } else {
+                Self::validate_input(&prior.input)?;
+                let physical = backend.physical(&prior.input)?.join(&prior.child);
+                if !physical.symlink_metadata()?.is_dir() {
+                    bail!("incremental input child lacks immutable backing");
+                }
+                physical
+            };
             let local = prior.directory.join(&prior.child);
             if local.symlink_metadata().is_ok() {
-                Self::verify(&physical, &local, verifier)?;
+                if mode == SnapshotMode::Audit {
+                    Self::verify(&physical, &local, verifier)?;
+                } else if !local.symlink_metadata()?.is_dir() {
+                    bail!("incremental child must remain a directory");
+                }
                 children.insert(local);
             }
             // Retained receipts themselves name their previous immutable input,
@@ -610,10 +624,22 @@ mod tests {
         assert!(cold.input.is_none());
         assert!(make_state().bind(&backend).is_err());
         cold.deliver(&backend, output).unwrap();
-        assert!(State::snapshot_references(&backend, &mut Verifier::default()).is_err());
+        assert!(
+            State::snapshot_references(&backend, &mut Verifier::default(), SnapshotMode::Audit)
+                .is_err()
+        );
+        assert!(
+            State::snapshot_references(
+                &backend,
+                &mut Verifier::default(),
+                SnapshotMode::Incremental
+            )
+            .is_err()
+        );
         drop(lease);
         let (references, count, leases) =
-            State::snapshot_references(&backend, &mut Verifier::default()).unwrap();
+            State::snapshot_references(&backend, &mut Verifier::default(), SnapshotMode::Audit)
+                .unwrap();
         assert_eq!(references, BTreeSet::from([output.to_path_buf()]));
         assert_eq!(count, 1);
         assert!(make_state().bind(&backend).is_err());
@@ -628,7 +654,19 @@ mod tests {
         let object = directory.join("rustc-selected-child/session/object.o");
         fs::write(&object, "tampered").unwrap();
         assert!(make_state().bind(&backend).is_err());
-        assert!(State::snapshot_references(&backend, &mut Verifier::default()).is_err());
+        assert!(
+            State::snapshot_references(&backend, &mut Verifier::default(), SnapshotMode::Audit)
+                .is_err()
+        );
+        let (references, count, leases) = State::snapshot_references(
+            &backend,
+            &mut Verifier::default(),
+            SnapshotMode::Incremental,
+        )
+        .unwrap();
+        assert_eq!(references, BTreeSet::from([output.to_path_buf()]));
+        assert_eq!(count, 1);
+        drop(leases);
         fs::write(&object, "owned object").unwrap();
         fs::write(directory.join("rustc-selected-child/unexpected"), "unbound").unwrap();
         assert!(make_state().bind(&backend).is_err());
@@ -644,7 +682,18 @@ mod tests {
         fs::write(&object, "owned object").unwrap();
         fs::rename(&physical, root.join("missing-backing-output")).unwrap();
         assert!(make_state().bind(&backend).is_err());
-        assert!(State::snapshot_references(&backend, &mut Verifier::default()).is_err());
+        assert!(
+            State::snapshot_references(&backend, &mut Verifier::default(), SnapshotMode::Audit)
+                .is_err()
+        );
+        assert!(
+            State::snapshot_references(
+                &backend,
+                &mut Verifier::default(),
+                SnapshotMode::Incremental
+            )
+            .is_err()
+        );
         // The same missing backing output must never matter after stripping.
         fs::remove_dir_all(&directory).unwrap();
         let mut stripped = make_state();
@@ -657,7 +706,8 @@ mod tests {
         drop(lease);
         fs::rename(root.join("missing-backing-output"), &physical).unwrap();
         let (references, count, leases) =
-            State::snapshot_references(&backend, &mut Verifier::default()).unwrap();
+            State::snapshot_references(&backend, &mut Verifier::default(), SnapshotMode::Audit)
+                .unwrap();
         assert_eq!(references, BTreeSet::from([output.to_path_buf()]));
         assert_eq!(count, 0);
         drop(leases);
@@ -668,6 +718,34 @@ mod tests {
         assert!(unowned.input.is_none());
         assert!(unowned.deliver(&backend, output).is_err());
         drop(lease);
+
+        fs::remove_dir_all(directory.join("rustc-selected-child")).unwrap();
+        let lease = unowned.bind(&backend).unwrap();
+        unowned.deliver(&backend, output).unwrap();
+        drop(lease);
+        let mut changed = make_state();
+        let lease = changed.bind(&backend).unwrap();
+        let updated = Path::new("/nix/store/11111111111111111111111111111111-result");
+        let updated_physical = backend.physical(updated).unwrap();
+        fs::create_dir_all(updated_physical.join("incremental/rustc-selected-child/session"))
+            .unwrap();
+        fs::write(
+            updated_physical.join("incremental/rustc-selected-child/session/object.o"),
+            "updated object",
+        )
+        .unwrap();
+        changed.deliver(&backend, updated).unwrap();
+        drop(lease);
+        let (references, count, leases) = State::snapshot_references(
+            &backend,
+            &mut Verifier::default(),
+            SnapshotMode::Incremental,
+        )
+        .unwrap();
+        assert_eq!(references, BTreeSet::from([updated.to_path_buf()]));
+        assert_eq!(count, 1);
+        drop(leases);
+        assert_eq!(fs::read(&object).unwrap(), b"updated object");
         fs::remove_dir_all(root).unwrap();
     }
 }

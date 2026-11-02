@@ -366,6 +366,15 @@ pub(super) struct SnapshotReferences {
     seconds: f64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SnapshotMode {
+    Audit,
+    // Requires the caller's validated pre-run retention checkpoint. The returned
+    // references must be unioned with its existing roots, never used to prune.
+    // This collects ownership; consumption still authenticates mutable bytes.
+    Incremental,
+}
+
 // Own the child until its pipes are drained and it is reaped. In particular,
 // an early metadata decoder/import error must cancel the live Nix client.
 struct CapturedProcess {
@@ -1049,7 +1058,7 @@ impl Backend {
     pub(super) fn reject_incomplete(&self) -> eyre::Result<()> {
         fs::write(
             self.config.target.join(".dyndrv-delivered/rejected"),
-            b"Cargo swallowed an incomplete Nix compiler invocation\n",
+            b"Cargo session contains an incomplete wrapper invocation\n",
         )?;
         Ok(())
     }
@@ -1122,7 +1131,10 @@ impl Backend {
         Ok(receipt)
     }
 
-    pub(super) fn snapshot_references(&self) -> eyre::Result<SnapshotReferences> {
+    pub(super) fn snapshot_references(
+        &self,
+        mode: SnapshotMode,
+    ) -> eyre::Result<SnapshotReferences> {
         let started = Instant::now();
         if self.config.artifact_delivery == ArtifactDelivery::SystemStoreRlibLinks {
             Self::configured_socket(&self.config)?;
@@ -1134,7 +1146,7 @@ impl Backend {
         }
         let mut verifier = Verifier::default();
         let (mut references, incremental_children, _leases) =
-            incremental::State::snapshot_references(self, &mut verifier)?;
+            incremental::State::snapshot_references(self, &mut verifier, mode)?;
         let mut owners = BTreeMap::new();
         // Overlapping transitive maps may repeat immutable paths. Cache only
         // exact backing paths for this snapshot, with files and trees separate.
@@ -1172,16 +1184,22 @@ impl Backend {
             }
             self.validate_target_parent(key)?;
             match key.symlink_metadata() {
-                Ok(_) => {
+                Ok(info) => {
                     if receipt.compiler_status.is_none() {
                         bail!("snapshot artifact is incomplete");
                     }
-                    self.validate_receipt_contents(
-                        key,
-                        &receipt,
-                        &receipt.files[*key],
-                        &mut verifier,
-                    )?;
+                    if mode == SnapshotMode::Audit
+                        || receipt.owned[*key] == Representation::StoreLink
+                    {
+                        self.validate_receipt_contents(
+                            key,
+                            &receipt,
+                            &receipt.files[*key],
+                            &mut verifier,
+                        )?;
+                    } else if !info.is_file() {
+                        bail!("copied compiler artifact must remain a regular file");
+                    }
                     owners.insert((*key).clone(), receipt.files[*key].clone());
                 }
                 // Build scripts may remove their positive/negative probe files.
@@ -2555,6 +2573,7 @@ impl Backend {
 mod tests {
     use super::super::{Completion, Session};
     use super::*;
+    use libc::SIGTERM;
     use std::env;
     use std::fs::{DirBuilder, FileTimes};
     use std::os::unix::fs::DirBuilderExt;
@@ -2884,9 +2903,10 @@ mod tests {
         Backend::write_json(
             &root.join("cargo-result.json"),
             &Completion {
-                version: 2,
+                version: 3,
                 status: 0,
                 nix_invocations: 0,
+                artifacts_complete: true,
             },
         )
         .unwrap();
@@ -2911,6 +2931,158 @@ mod tests {
     }
 
     #[test]
+    fn incremental_collection_retains_changed_sources_without_authenticating_mutable_bytes() {
+        let fixture = ArtifactFixture::new();
+        let mut receipt = fixture.receipt("debug/deps");
+        for target in receipt.owned.keys() {
+            fixture.prepared.publish_receipt(target, &receipt).unwrap();
+        }
+        let previous = fixture
+            .prepared
+            .snapshot_references(SnapshotMode::Audit)
+            .unwrap();
+        let generated = Path::new("/nix/store/11111111111111111111111111111111-generated");
+        fs::create_dir_all(fixture.prepared.physical(generated).unwrap()).unwrap();
+        receipt.trees.insert(
+            fixture.prepared.config.target.join("debug/build/unit/out"),
+            generated.to_path_buf(),
+        );
+        for target in receipt.owned.keys() {
+            fixture.prepared.publish_receipt(target, &receipt).unwrap();
+        }
+        let target = receipt.owned.keys().next().unwrap();
+        fs::write(target, b"corrupt target").unwrap();
+        let current = fixture
+            .prepared
+            .snapshot_references(SnapshotMode::Incremental)
+            .unwrap();
+        assert!(current.store_paths.is_superset(&previous.store_paths));
+        assert!(current.store_paths.contains(generated));
+        assert!(
+            fixture
+                .prepared
+                .snapshot_references(SnapshotMode::Audit)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .prepared
+                .validate_receipt_contents(
+                    target,
+                    &receipt,
+                    &receipt.files[target],
+                    &mut Verifier::default(),
+                )
+                .is_err(),
+            "consuming an incremental checkpoint still authenticates target bytes"
+        );
+
+        for target in receipt.owned.keys() {
+            fs::remove_file(fixture.prepared.receipt(target)).unwrap();
+        }
+        let deleted = fixture
+            .prepared
+            .snapshot_references(SnapshotMode::Incremental)
+            .unwrap();
+        assert!(deleted.store_paths.is_empty());
+        let mut retained = current.store_paths;
+        retained.extend(deleted.store_paths);
+        assert!(
+            retained.contains(generated),
+            "incremental collection must never prune"
+        );
+        assert!(fixture.prepared.delivered(target).is_err());
+    }
+
+    #[test]
+    fn incremental_collection_rejects_incomplete_receipts_missing_backing_and_anomalies() {
+        let fixture = ArtifactFixture::new();
+        let mut receipt = fixture.receipt("debug/deps");
+        let target = receipt.owned.keys().next().unwrap().to_path_buf();
+        receipt.compiler_status = None;
+        fixture.prepared.publish_receipt(&target, &receipt).unwrap();
+        assert!(
+            fixture
+                .prepared
+                .snapshot_references(SnapshotMode::Incremental)
+                .is_err()
+        );
+        receipt.compiler_status = Some(1 << 8);
+        fixture.prepared.publish_receipt(&target, &receipt).unwrap();
+        assert!(
+            fixture
+                .prepared
+                .snapshot_references(SnapshotMode::Incremental)
+                .is_ok()
+        );
+        let state = fixture.prepared.config.target.join(".dyndrv-delivered");
+        for name in ["rejected", "interrupted.tmp"] {
+            fs::write(state.join(name), b"unfinished").unwrap();
+            assert!(
+                fixture
+                    .prepared
+                    .snapshot_references(SnapshotMode::Incremental)
+                    .is_err()
+            );
+            fs::remove_file(state.join(name)).unwrap();
+        }
+        fs::remove_file(fixture.prepared.physical(&receipt.files[&target]).unwrap()).unwrap();
+        assert!(
+            fixture
+                .prepared
+                .snapshot_references(SnapshotMode::Incremental)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn incremental_snapshot_accepts_only_ordinary_complete_failures() {
+        let fixture = ArtifactFixture::new();
+        let root = fixture.root.join("session");
+        fs::create_dir(&root).unwrap();
+        Backend::write_json(
+            &root.join("session.json"),
+            &serde_json::json!({"version": 2, "rustdoc": [], "nix": fixture.prepared}),
+        )
+        .unwrap();
+        let output = root.join("references.json");
+        let arguments = [
+            "--directory".into(),
+            root.to_path_buf().into_os_string(),
+            "--output".into(),
+            output.to_path_buf().into_os_string(),
+            "--incremental".into(),
+        ];
+        for (status, artifacts_complete, accepted) in [
+            (0, true, true),
+            (23 << 8, true, true),
+            (23 << 8, false, false),
+            (0, false, false),
+            (SIGTERM, true, false),
+        ] {
+            Backend::write_json(
+                &root.join("cargo-result.json"),
+                &Completion {
+                    version: 3,
+                    status,
+                    nix_invocations: 0,
+                    artifacts_complete,
+                },
+            )
+            .unwrap();
+            assert_eq!(Session::snapshot_references(&arguments).is_ok(), accepted);
+            if accepted {
+                fs::remove_file(&output).unwrap();
+            }
+            if status != 0 || !artifacts_complete {
+                assert!(Session::snapshot_references(&arguments[..4]).is_err());
+            }
+            assert!(!output.exists());
+            fs::remove_file(root.join("cargo-result.json")).unwrap();
+        }
+    }
+
+    #[test]
     fn artifact_delivery_defaults_and_receipts_have_explicit_representations() {
         let mut fixture = ArtifactFixture::new();
         let config = &mut fixture.prepared.config;
@@ -2922,7 +3094,12 @@ mod tests {
         config.artifact_delivery = ArtifactDelivery::SystemStoreRlibLinks;
         assert!(Backend::configured_socket(config).is_err());
         // Snapshot reload must rerun the live gate even with no owned links.
-        assert!(fixture.prepared.snapshot_references().is_err());
+        assert!(
+            fixture
+                .prepared
+                .snapshot_references(SnapshotMode::Audit)
+                .is_err()
+        );
         fixture.prepared.config.store_mode = StoreMode::System;
         let mut receipt = fixture.receipt("debug/deps");
         let target = fixture
@@ -3203,21 +3380,37 @@ mod tests {
         for target in receipt.owned.keys() {
             fixture.prepared.publish_receipt(target, &receipt).unwrap();
         }
-        let present = fixture.prepared.snapshot_references().unwrap();
+        let present = fixture
+            .prepared
+            .snapshot_references(SnapshotMode::Audit)
+            .unwrap();
         let directory = fixture.prepared.config.target.join("debug/build/probe");
         fs::remove_dir_all(&directory).unwrap();
-        let absent = fixture.prepared.snapshot_references().unwrap();
+        let absent = fixture
+            .prepared
+            .snapshot_references(SnapshotMode::Audit)
+            .unwrap();
         assert_eq!(absent.owned_files, 0);
         assert_eq!(absent.store_paths, present.store_paths);
         // A dangling ancestor link must not be mistaken for a removed probe.
         unix_fs::symlink(fixture.root.join("missing"), &directory).unwrap();
-        assert!(fixture.prepared.snapshot_references().is_err());
+        assert!(
+            fixture
+                .prepared
+                .snapshot_references(SnapshotMode::Audit)
+                .is_err()
+        );
         fs::remove_file(&directory).unwrap();
         let state = fixture.prepared.config.target.join(".dyndrv-delivered");
         let moved = fixture.root.join("moved-receipts");
         fs::rename(&state, &moved).unwrap();
         unix_fs::symlink(&moved, &state).unwrap();
-        assert!(fixture.prepared.snapshot_references().is_err());
+        assert!(
+            fixture
+                .prepared
+                .snapshot_references(SnapshotMode::Audit)
+                .is_err()
+        );
         assert!(
             fixture
                 .prepared
@@ -3228,7 +3421,12 @@ mod tests {
         fs::rename(&moved, &state).unwrap();
         let target = receipt.owned.keys().next().unwrap();
         fs::remove_file(fixture.prepared.physical(&receipt.files[target]).unwrap()).unwrap();
-        assert!(fixture.prepared.snapshot_references().is_err());
+        assert!(
+            fixture
+                .prepared
+                .snapshot_references(SnapshotMode::Audit)
+                .is_err()
+        );
     }
 
     #[test]
@@ -3840,10 +4038,10 @@ mod tests {
                 .unwrap(),
             early
         );
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         bytes[0] ^= 1;
         fs::write(&archive, &bytes).unwrap();
-        let snapshot = backend.snapshot_references().unwrap();
+        let snapshot = backend.snapshot_references(SnapshotMode::Audit).unwrap();
         assert_eq!(snapshot.owned_files, 5);
         assert_eq!(snapshot.incremental_children, 0);
         assert_eq!(
@@ -3859,7 +4057,7 @@ mod tests {
         assert!(invalid.validate(&archive, &backend.config).is_err());
         backend.publish_receipt(&archive, &invalid).unwrap();
         assert!(backend.validate_replacement(&archive).is_err());
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         invalid.version = 6;
         // Keep this key mapped while removing another owned file's mapping.
         invalid.files.remove(&target.join("leaf.d")).unwrap();
@@ -3867,7 +4065,7 @@ mod tests {
         assert!(invalid.validate(&archive, &backend.config).is_err());
         backend.publish_receipt(&archive, &invalid).unwrap();
         assert!(backend.validate_replacement(&archive).is_err());
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         receipt(
             &["libleaf.rmeta", "libleaf.rlib", "leaf.d"],
             Some(0),
@@ -3876,9 +4074,9 @@ mod tests {
         // Expected compile-fail tests retain dep-info from finished rustc
         // failures. Snapshot ownership is distinct from link readiness.
         receipt(&["leaf.d"], None, subset(&["leaf.d"]));
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         receipt(&["leaf.d"], Some(1 << 8), subset(&["leaf.d"]));
-        let failed_probe = backend.snapshot_references().unwrap();
+        let failed_probe = backend.snapshot_references(SnapshotMode::Audit).unwrap();
         assert_eq!(failed_probe.owned_files, snapshot.owned_files);
         assert_eq!(failed_probe.store_paths, snapshot.store_paths);
         assert!(
@@ -3887,13 +4085,13 @@ mod tests {
                 .is_err()
         );
         fs::write(target.join("leaf.d"), "changed failed-probe artifact").unwrap();
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         fs::write(target.join("leaf.d"), "leaf.d").unwrap();
         receipt(&["leaf.d"], Some(0), subset(&["leaf.d"]));
         receipt(&["libleaf.rmeta"], None, subset(&["libleaf.rmeta"]));
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         fs::remove_file(target.join("libleaf.rmeta")).unwrap();
-        let deleted_probe = backend.snapshot_references().unwrap();
+        let deleted_probe = backend.snapshot_references(SnapshotMode::Audit).unwrap();
         assert_eq!(deleted_probe.owned_files, 4);
         assert_eq!(deleted_probe.store_paths, snapshot.store_paths);
         fs::write(target.join("libleaf.rmeta"), "libleaf.rmeta").unwrap();
@@ -3903,7 +4101,7 @@ mod tests {
             subset(&["libleaf.rmeta", "libleaf.rlib", "leaf.d"]),
         );
         backend.reject_incomplete().unwrap();
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         fs::remove_file(target.join(".dyndrv-delivered/rejected")).unwrap();
         // A transitive-only file must be checked even after a sibling in its
         // store root has passed. It has neither a current target nor a receipt.
@@ -3914,11 +4112,11 @@ mod tests {
         let mut retained = backend.delivered(&archive).unwrap();
         retained.files.insert(transitive, input);
         backend.publish_receipt(&archive, &retained).unwrap();
-        let complete = backend.snapshot_references().unwrap();
+        let complete = backend.snapshot_references(SnapshotMode::Audit).unwrap();
         assert_eq!(complete.owned_files, snapshot.owned_files);
         assert_eq!(complete.store_paths, snapshot.store_paths);
         fs::remove_file(&physical).unwrap();
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         receipt(
             &["libleaf.rmeta", "libleaf.rlib", "leaf.d"],
             Some(0),
@@ -3930,7 +4128,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(backend.snapshot_references().is_err());
+        assert!(backend.snapshot_references(SnapshotMode::Audit).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

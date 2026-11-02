@@ -175,6 +175,16 @@ building missing outputs; it also works after the daemon stops. It lists backing
 paths and ownership counts. It does not archive the target, sign an output, upload
 it, select a previous revision or restore a writable target.
 
+The worker may append `--incremental` after validating a retained-target
+checkpoint before the command. This mode checks receipt structure, immutable
+backing existence, and linked representations, but skips mutable payload byte
+comparisons and recursive incremental-state verification. Its results must be
+unioned with existing GC roots without pruning. It can retain a completed
+ordinary failed command whose version-3 completion reports complete artifacts;
+that does not certify successful compilation or tests. Default collection and
+explicit worker audit retain full validation. Signals, missing completion,
+unfinished delivery and rejected ownership cannot authorize incremental reuse.
+
 Wait for the application's required checks and a quiescent target before publishing
 accepted state. An application snapshot owner must perform those separate operations: identify
 compatible source/workload, toolchain, native inputs, driver policy and compiler

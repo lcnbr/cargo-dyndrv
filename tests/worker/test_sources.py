@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -104,6 +105,309 @@ class SourceLayoutTests(unittest.TestCase):
             for path in self.stage.rglob("*")
             if path.is_file()
         }
+
+    def warm_cache(self, metadata):
+        self.layout().prepare(metadata)
+        # Age the observation beyond the conservative timestamp tick without
+        # making every cache regression test sleep for a wall-clock second.
+        with mock.patch(
+            "sources.time.time_ns", return_value=time.time_ns() + 2_000_000_000
+        ):
+            return self.layout().prepare(metadata)
+
+    def test_warm_new_instance_reuses_verified_payload_without_reads_or_replacement(
+        self,
+    ):
+        metadata = self.metadata()
+        self.warm_cache(metadata)
+        source = self.workspace / "src/lib.rs"
+        staged = self.stage / "workspace/src/lib.rs"
+        before = staged.stat()
+        read_bytes = Path.read_bytes
+
+        def read(path):
+            self.assertNotIn(path, (source, staged), "warm payload must not be reread")
+            return read_bytes(path)
+
+        with mock.patch.object(Path, "read_bytes", read):
+            self.layout().prepare(metadata)
+        self.assertEqual(staged.stat().st_ino, before.st_ino)
+        self.assertEqual(staged.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_warm_same_size_same_mtime_edits_and_inode_replacement_are_detected(self):
+        metadata = self.metadata()
+        source = self.workspace / "src/lib.rs"
+        staged = self.stage / "workspace/src/lib.rs"
+        for replace, value in ((False, 2), (True, 3)):
+            with self.subTest(replace=replace):
+                self.warm_cache(metadata)
+                original = source.stat()
+                before = staged.stat()
+                changed = source.with_suffix(".new") if replace else source
+                changed.write_text(f"pub fn value() -> u32 {{ {value} }}\n")
+                os.utime(changed, ns=(original.st_atime_ns, original.st_mtime_ns))
+                if replace:
+                    changed.replace(source)
+                    self.assertNotEqual(source.stat().st_ino, original.st_ino)
+                self.assertEqual(source.stat().st_size, original.st_size)
+                self.assertEqual(source.stat().st_mtime_ns, original.st_mtime_ns)
+                self.layout().prepare(metadata)
+                self.assertEqual(staged.read_bytes(), source.read_bytes())
+                self.assertGreater(staged.stat().st_mtime_ns, before.st_mtime_ns)
+                timestamp = staged.stat().st_mtime_ns
+                self.layout().prepare(metadata)
+                self.assertEqual(staged.stat().st_mtime_ns, timestamp)
+
+    def test_warm_destination_damage_and_permission_changes_are_repaired(self):
+        metadata = self.metadata()
+        source = self.workspace / "src/lib.rs"
+        staged = self.stage / "workspace/src/lib.rs"
+        for damage in ("contents", "replacement", "permissions", "deleted"):
+            with self.subTest(damage=damage):
+                self.warm_cache(metadata)
+                before = staged.stat()
+                if damage in {"contents", "replacement"}:
+                    changed = (
+                        staged.with_suffix(".new")
+                        if damage == "replacement"
+                        else staged
+                    )
+                    changed.write_text("pub fn value() -> u32 { 9 }\n")
+                    os.utime(changed, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    if damage == "replacement":
+                        changed.replace(staged)
+                elif damage == "permissions":
+                    staged.chmod(0o400)
+                else:
+                    staged.unlink()
+                self.layout().prepare(metadata)
+                self.assertEqual(staged.read_bytes(), source.read_bytes())
+                self.assertEqual(
+                    staged.stat().st_mode & 0o777, source.stat().st_mode & 0o777
+                )
+                if damage == "permissions":
+                    self.assertEqual(staged.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_warm_permission_change_replaces_hardlinks_and_retains_content_timestamp(
+        self,
+    ):
+        metadata = self.metadata()
+        self.warm_cache(metadata)
+        source = self.workspace / "src/lib.rs"
+        staged = self.stage / "workspace/src/lib.rs"
+        before = staged.stat()
+        outside = self.directory / "outside-hardlink"
+        os.link(staged, outside)
+        source.chmod(0o444)
+        self.layout().prepare(metadata)
+        self.assertEqual(staged.stat().st_mode & 0o777, 0o444)
+        self.assertEqual(outside.stat().st_mode & 0o777, before.st_mode & 0o777)
+        self.assertNotEqual(staged.stat().st_ino, outside.stat().st_ino)
+        self.assertEqual(staged.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_warm_inventory_observes_deletions_ignore_rules_and_file_directory_changes(
+        self,
+    ):
+        selected = self.workspace / "asset"
+        tracked = self.workspace / "tracked"
+        ignored = self.workspace / "ignored"
+        for path in (selected, tracked, ignored):
+            self.write(path, "asset")
+        self.command("git", "add", "tracked")
+        metadata = self.metadata()
+        self.warm_cache(metadata)
+        selected.unlink()
+        tracked.unlink()
+        self.write(selected / "child", "new child")
+        self.write(self.workspace / ".gitignore", "ignored\n")
+        self.layout().prepare(metadata)
+        self.assertFalse((self.stage / "workspace/tracked").exists())
+        self.assertFalse((self.stage / "workspace/ignored").exists())
+        self.assertEqual(
+            (self.stage / "workspace/asset/child").read_text(), "new child"
+        )
+        self.warm_cache(metadata)
+        shutil.rmtree(selected)
+        self.write(selected, "file again")
+        self.layout().prepare(metadata)
+        self.assertEqual((self.stage / "workspace/asset").read_text(), "file again")
+
+    def test_warm_root_identity_change_rewrites_unchanged_referring_manifest(self):
+        self.patch_workspace()
+        metadata = self.metadata()
+        first = self.warm_cache(metadata)
+        original = (self.workspace / "Cargo.toml").read_bytes()
+        document = tomllib.loads((self.external / "Cargo.toml").read_text())
+        document["workspace"]["package"]["version"] = "1.0.1"
+        (self.external / "Cargo.toml").write_text(tomli_w.dumps(document))
+        result = self.layout().prepare(self.metadata())
+        self.assertEqual((self.workspace / "Cargo.toml").read_bytes(), original)
+        self.assertNotEqual(first["package_sources"], result["package_sources"])
+        self.assertFalse(Path(first["package_sources"][0]).exists())
+        staged = tomllib.loads(Path(result["manifest"]).read_text())
+        self.assertEqual(
+            staged["patch"]["crates-io"]["local"]["path"],
+            result["package_sources"][0] + "/crates/local",
+        )
+        self.metadata(Path(result["workspace"]))
+
+    def test_warm_source_and_destination_symlinks_are_revalidated_before_deletion(self):
+        alias = self.workspace / "alias"
+        alias.symlink_to("src/lib.rs")
+        metadata = self.metadata()
+        self.warm_cache(metadata)
+        retained = self.stage / "workspace/retained"
+        self.write(retained, "retain until validation succeeds")
+        outside = self.directory / "outside"
+        self.write(outside, "outside")
+        alias.unlink()
+        alias.symlink_to(outside)
+        before = self.stage_state()
+        with self.assertRaisesRegex(ValueError, "escapes declared roots"):
+            self.layout().prepare(metadata)
+        self.assertEqual(self.stage_state(), before)
+        alias.unlink()
+        alias.symlink_to("src/lib.rs")
+        staged = self.stage / "workspace/src/lib.rs"
+        staged.unlink()
+        staged.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "staged file or symlink"):
+            self.layout().prepare(metadata)
+        self.assertEqual(outside.read_text(), "outside")
+        self.assertTrue(retained.exists())
+
+    def test_missing_or_malformed_cache_rechecks_bytes(self):
+        metadata = self.metadata()
+        cache = self.stage / ".source-state.json"
+        staged = self.stage / "workspace/src/lib.rs"
+        for contents in (
+            None,
+            "not json",
+            "[]",
+            '{"version": 1, "files": []}',
+            '{"version": 999}',
+        ):
+            with self.subTest(contents=contents):
+                self.warm_cache(metadata)
+                staged.write_text("bad staged contents")
+                if contents is None:
+                    cache.unlink()
+                else:
+                    cache.write_text(contents)
+                self.layout().prepare(metadata)
+                self.assertEqual(
+                    staged.read_bytes(), (self.workspace / "src/lib.rs").read_bytes()
+                )
+                self.assertEqual(json.loads(cache.read_text())["version"], 1)
+
+    def test_recent_cache_observation_cannot_skip_content_validation(self):
+        metadata = self.metadata()
+        self.warm_cache(metadata)
+        cache = self.stage / ".source-state.json"
+        document = json.loads(cache.read_text())
+        source = self.workspace / "src/lib.rs"
+        document["verified_before_ns"] = source.stat().st_ctime_ns
+        cache.write_text(json.dumps(document))
+        reads = []
+        read_bytes = Path.read_bytes
+
+        def read(path):
+            reads.append(path)
+            return read_bytes(path)
+
+        with mock.patch.object(Path, "read_bytes", read):
+            self.layout().prepare(metadata)
+        self.assertIn(source, reads)
+
+    def test_mutation_during_capture_fails_before_stale_deletion(self):
+        metadata = self.metadata()
+        self.warm_cache(metadata)
+        retained = self.stage / "workspace/retained"
+        self.write(retained, "keep")
+        source = self.workspace / "src/lib.rs"
+        source.write_text("pub fn value() -> u32 { 2 }\n")
+        before = self.stage_state()
+        read_bytes = Path.read_bytes
+
+        def read(path):
+            content = read_bytes(path)
+            if path == source:
+                source.write_text("pub fn value() -> u32 { 3 }\n")
+            return content
+
+        with (
+            mock.patch.object(Path, "read_bytes", read),
+            self.assertRaisesRegex(ValueError, "source changed"),
+        ):
+            self.layout().prepare(metadata)
+        self.assertEqual(self.stage_state(), before)
+        self.layout().prepare(metadata)
+        self.assertEqual(
+            (self.stage / "workspace/src/lib.rs").read_bytes(), source.read_bytes()
+        )
+
+    def test_parent_replaced_with_outside_symlink_between_siblings_is_rejected(self):
+        first = self.workspace / "src/a.rs"
+        self.write(first, "first sibling")
+        metadata = self.metadata()
+        self.warm_cache(metadata)
+        self.write(
+            self.stage / "workspace/retained", "retain until validation succeeds"
+        )
+        first.write_text("changed first sibling")
+        outside = self.directory / "outside"
+        self.write(outside / "lib.rs", "outside bytes must never be staged")
+        before = self.stage_state()
+        read_bytes = Path.read_bytes
+
+        # Preserve the first file's identity across the swap, so only the next
+        # sibling's ancestor resolution can detect this containment violation.
+        os.link(first, outside / "a.rs")
+
+        def swap_after_read(path):
+            content = read_bytes(path)
+            if path == first:
+                (self.workspace / "src").rename(self.workspace / "saved-src")
+                (self.workspace / "src").symlink_to(outside, target_is_directory=True)
+            return content
+
+        with (
+            mock.patch.object(Path, "read_bytes", swap_after_read),
+            self.assertRaisesRegex(ValueError, "escapes declared roots"),
+        ):
+            self.layout().prepare(metadata)
+        self.assertEqual(self.stage_state(), before)
+
+    def test_failed_apply_does_not_publish_cache_and_retry_repairs_partial_stage(self):
+        metadata = self.metadata()
+        self.warm_cache(metadata)
+        cache = self.stage / ".source-state.json"
+        original_cache = cache.read_bytes()
+        source = self.workspace / "src/lib.rs"
+        source.write_text("pub fn value() -> u32 { 2 }\n")
+        self.write(self.workspace / "src/added.rs", "pub fn added() {}\n")
+        replace = Path.replace
+        count = 0
+
+        def fail_second(path, destination):
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise OSError("injected stage failure")
+            return replace(path, destination)
+
+        with (
+            mock.patch.object(Path, "replace", fail_second),
+            self.assertRaisesRegex(OSError, "injected"),
+        ):
+            self.layout().prepare(metadata)
+        self.assertEqual(cache.read_bytes(), original_cache)
+        self.assertFalse(list(self.stage.rglob(".dyndrv-source-*")))
+        self.layout().prepare(metadata)
+        self.assertEqual(
+            (self.stage / "workspace/src/lib.rs").read_bytes(), source.read_bytes()
+        )
+        self.assertTrue((self.stage / "workspace/src/added.rs").is_file())
 
     def test_result_module_names_are_sources_while_nix_output_links_are_excluded(self):
         self.write(self.workspace / "src/results.rs", "pub fn value() -> u32 { 7 }\n")

@@ -162,6 +162,7 @@ class SourceLayout:
         workspaces = {}
         located = {manifest for manifest in manifests if manifest.is_relative_to(main)}
         inspected = set()
+        inventories_by_root = {}
         while True:
             for manifest in sorted(manifests - located):
                 if not manifest.is_file():
@@ -223,10 +224,10 @@ class SourceLayout:
                     )
                 located.add(manifest)
 
-            inventories = self._inventories(roots, manifests)
+            inventories = self._inventories(roots, manifests, inventories_by_root)
             sources = (
                 (source, resolved)
-                for _, source, resolved in self._source_files(
+                for _, source, resolved, _ in self._source_files(
                     inventories, discovering=True
                 )
             )
@@ -282,6 +283,7 @@ class SourceLayout:
         return (
             [mapped_roots[0], *sorted(mapped_roots[1:], key=lambda root: str(root[1]))],
             manifests,
+            inventories,
         )
 
     @staticmethod
@@ -369,8 +371,13 @@ class SourceLayout:
             result = tomli_w.dumps(document).encode()
         return result
 
-    def _inventories(self, roots, manifests):
-        inventories = {root: self._inventory(root) for root in roots}
+    def _inventories(self, roots, manifests, inventories_by_root):
+        def inventory(root):
+            if root not in inventories_by_root:
+                inventories_by_root[root] = self._inventory(root)
+            return inventories_by_root[root]
+
+        inventories = {root: inventory(root).copy() for root in roots}
         # A dependency's repository can be nested inside an ignored directory
         # of another source root (including Git submodules). Keep its inventory
         # even though its physical tree shares the enclosing root's mapping.
@@ -393,7 +400,7 @@ class SourceLayout:
         for directory in sorted(repositories, key=lambda path: len(path.parts)):
             owner = repositories[directory]
             inventories[owner].discard(directory)
-            inventories[owner].update(self._inventory(directory))
+            inventories[owner].update(inventory(directory))
         return inventories
 
     def _source_files(self, inventories, discovering=False):
@@ -413,21 +420,29 @@ class SourceLayout:
             ):
                 return
             try:
+                # Resolve ancestors for every file: an editor can replace a
+                # parent with a symlink between sibling captures.
                 resolved = source.resolve(strict=True)
+                status = resolved.stat()
             except (OSError, RuntimeError) as error:
                 raise ValueError(
                     f"broken or cyclic source symlink: {source}"
                 ) from error
-            owners = [root for root in inventories if resolved.is_relative_to(root)]
+            # These are absolute resolved paths. Comparing component prefixes
+            # avoids rebuilding every ancestor for every file in a large tree.
+            parts = resolved.parts
+            owners = [
+                root for root in inventories if parts[: len(root.parts)] == root.parts
+            ]
             if not owners:
                 # Explicit declarations may introduce this target's root on the
                 # next discovery pass. The final plan always requires ownership.
                 if discovering:
                     return
                 raise ValueError(f"source symlink escapes declared roots: {source}")
-            if any(self._excluded(resolved.relative_to(root)) for root in owners):
+            if any(self._excluded(Path(*parts[len(root.parts) :])) for root in owners):
                 raise ValueError(f"source symlink targets an excluded path: {source}")
-            mode = resolved.stat().st_mode
+            mode = status.st_mode
             if stat.S_ISDIR(mode):
                 if not source.is_symlink():
                     raise ValueError(f"unsupported directory VCS entry: {source}")
@@ -444,36 +459,96 @@ class SourceLayout:
                 raise ValueError(f"unsupported special source file: {source}")
             if resolved != source and resolved not in selected:
                 raise ValueError(f"source symlink targets a VCS-ignored file: {source}")
-            yield source, resolved
+            yield source, resolved, status
 
         for root, inventory in inventories.items():
             for source in sorted(inventory):
-                for alias, resolved in expand(source, {root}):
-                    yield root, alias, resolved
+                for alias, resolved, status in expand(source, {root}):
+                    yield root, alias, resolved, status
 
-    def _plan(self, roots, manifests):
-        inventories = self._inventories([root for root, _ in roots], manifests)
+    @staticmethod
+    def _signature(status):
+        # POSIX ctime changes on writes/chmod even when mtime is restored. Both
+        # sides must match: Cargo/build scripts can also modify the staged tree.
+        return [
+            status.st_dev,
+            status.st_ino,
+            status.st_mode,
+            status.st_nlink,
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+        ]
+
+    def _read_cache(self):
+        path = self.stage / ".source-state.json"
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                raise ValueError(f"unsupported staged source cache: {path}")
+            cache = json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        if (
+            os.name != "posix"
+            or not isinstance(cache, dict)
+            or cache.get("version") != 1
+            or not isinstance(cache.get("verified_before_ns"), int)
+            or not isinstance(cache.get("files"), dict)
+        ):
+            return {}
+        return cache
+
+    def _plan(self, roots, inventories, cache):
         relative_roots = dict(roots)
         files = {}
-        for root, source, resolved in self._source_files(inventories):
-            destination = relative_roots[root] / source.relative_to(root)
-            content = resolved.read_bytes()
-            if (
+        for root, source, resolved, source_stat in self._source_files(inventories):
+            destination = relative_roots[root].joinpath(
+                *source.parts[len(root.parts) :]
+            )
+            configuration = (
                 destination.name in {"config", "config.toml"}
                 and destination.parent.name == ".cargo"
+            )
+            signature = [str(resolved), self._signature(source_stat)]
+            previous = None
+            if cache and not configuration and destination.name != "Cargo.toml":
+                try:
+                    previous = (self.stage / destination).lstat()
+                except (FileNotFoundError, NotADirectoryError):
+                    pass
+            if (
+                previous is not None
+                and stat.S_ISREG(previous.st_mode)
+                # A prior observation in the same coarse timestamp tick is not
+                # evidence of unchanged bytes. Never cache that racy interval.
+                and 0 < source_stat.st_ctime_ns < cache["verified_before_ns"]
+                and 0 < previous.st_ctime_ns < cache["verified_before_ns"]
+                and cache["files"].get(str(destination))
+                == [*signature, self._signature(previous)]
             ):
+                content = None
+            else:
+                content = resolved.read_bytes()
+                if self._signature(resolved.stat()) != signature[1]:
+                    raise ValueError(f"source changed while preparing: {source}")
+            if configuration:
                 content = self._configuration(source, content, roots)
             elif destination.name == "Cargo.toml":
                 content = self._manifest(source, content, roots)
-            files[destination] = (content, resolved.stat())
+            files[destination] = (content, source_stat, signature, previous)
         for root, relative in roots:
             if relative / "Cargo.toml" not in files:
                 raise ValueError(
                     f"source workspace manifest is excluded or missing: {root}"
                 )
+        directories = set()
         for path in files:
-            if any(parent in files for parent in path.parents):
-                raise ValueError(f"conflicting staged file and directory: {path}")
+            for parent in path.parents:
+                if parent in directories:
+                    break
+                if parent in files:
+                    raise ValueError(f"conflicting staged file and directory: {path}")
+                directories.add(parent)
         return files
 
     def _stage_inventory(self, roots):
@@ -485,16 +560,17 @@ class SourceLayout:
         for root, _ in roots:
             if self.stage.is_relative_to(root) or root.is_relative_to(self.stage):
                 raise ValueError(f"stage overlaps source root: {root}")
-        files, directories = [], []
+        files, directories = {}, []
 
         def visit(path):
-            mode = path.lstat().st_mode
+            status = path.lstat()
+            mode = status.st_mode
             if stat.S_ISDIR(mode):
                 directories.append(path)
                 for child in path.iterdir():
                     visit(child)
             elif stat.S_ISREG(mode):
-                files.append(path)
+                files[path] = status
             else:
                 raise ValueError(f"unsupported staged file or symlink: {path}")
 
@@ -505,8 +581,9 @@ class SourceLayout:
         return files, directories
 
     def prepare(self, metadata: dict) -> dict:
-        roots, manifests = self._discover(metadata)
-        files = self._plan(roots, manifests)
+        verified_before = time.time_ns() // 1_000_000_000 * 1_000_000_000
+        roots, manifests, inventories = self._discover(metadata)
+        files = self._plan(roots, inventories, self._read_cache())
         old_files, old_directories = self._stage_inventory(roots)
         manifest = self._mapped(self.workspace / "Cargo.toml", roots)
         for source in manifests:
@@ -519,23 +596,42 @@ class SourceLayout:
             raise ValueError(
                 f"requested manifest is excluded or missing: {self.workspace}"
             )
+        for relative, (content, _, _, previous) in files.items():
+            if content is None:
+                observed = old_files.get(self.stage / relative)
+                if observed is None or self._signature(observed) != self._signature(
+                    previous
+                ):
+                    raise ValueError(
+                        f"staged source changed while preparing: {relative}"
+                    )
 
         # All source and destination validation precedes the first stage mutation.
         expected = {self.stage / path for path in files}
         for path in old_files:
             if path not in expected:
                 path.unlink()
-        needed = {parent for path in expected for parent in path.parents}
+        needed = set()
+        for path in expected:
+            for parent in path.parents:
+                if parent in needed:
+                    break
+                needed.add(parent)
         for path in sorted(old_directories, key=lambda path: -len(path.parts)):
             if path not in needed:
                 path.rmdir()
-        for relative, (content, source_stat) in files.items():
+        records = {}
+        for relative, (content, source_stat, signature, _) in files.items():
             destination = self.stage / relative
-            previous = destination.stat() if destination.exists() else None
+            previous = old_files.get(destination)
+            if content is None:
+                records[str(relative)] = [*signature, self._signature(previous)]
+                continue
             same_content = previous is not None and destination.read_bytes() == content
             if same_content and stat.S_IMODE(previous.st_mode) == stat.S_IMODE(
                 source_stat.st_mode
             ):
+                records[str(relative)] = [*signature, self._signature(previous)]
                 continue
             destination.parent.mkdir(parents=True, exist_ok=True)
             modified = previous.st_mtime_ns if same_content else source_stat.st_mtime_ns
@@ -554,9 +650,35 @@ class SourceLayout:
                     os.fchmod(output.fileno(), stat.S_IMODE(source_stat.st_mode))
                     os.utime(output.fileno(), ns=(source_stat.st_atime_ns, modified))
                 temporary.replace(destination)
+                records[str(relative)] = [
+                    *signature,
+                    self._signature(destination.stat()),
+                ]
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
+        # Publish only after a complete mirror. A failed apply leaves old
+        # signatures, which cannot certify replaced files on the next run.
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=self.stage, prefix=".dyndrv-source-", delete=False
+            ) as output:
+                temporary = Path(output.name)
+                output.write(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "verified_before_ns": verified_before,
+                            "files": records,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+            temporary.replace(self.stage / ".source-state.json")
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         return {
             "workspace": str(self.logical / "workspace"),
             "package_sources": [

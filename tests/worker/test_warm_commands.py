@@ -15,12 +15,14 @@ from test_integration import Harness
 
 
 class WarmCommandsHarness(Harness):
-    def completion(self, record, *, prepared, validation):
+    def completion(self, record, *, prepared, validation, status=0):
         session = Path(record["session"])
         value = json.loads((session / "cargo-result.json").read_text())
         self.require(
-            value["version"] == 2 and value["status"] == 0,
-            "Missing successful completion protocol",
+            value["version"] == 3
+            and value["status"] == status << 8
+            and value["artifacts_complete"] is True,
+            "Missing completed artifact delivery protocol",
         )
         observations = [
             json.loads(path.read_text())
@@ -41,6 +43,7 @@ class WarmCommandsHarness(Harness):
         )
         last = json.loads((session.parent.parent / "last-run.json").read_text())
         self.require(last["session"] == str(session), "Wrong worker result")
+        self.require(last["status"] == status, "Wrong command status")
         self.require(last["ownership_validation"] == validation, "Wrong ownership path")
         if validation == "retained":
             self.require(
@@ -123,7 +126,7 @@ class WarmCommandsHarness(Harness):
             self.edit_fork(self.fork_a, "clean")
             os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
             changed = self.run_value(self.a, "same-mtime-edit", "clean")
-            self.completion(changed, prepared=True, validation="full")
+            self.completion(changed, prepared=True, validation="incremental")
             self.edit_fork(self.fork_a, "dirty")
             self.run_value(self.a, "restore-source", "dirty")
             restored = self.run_value(self.a, "restore-source-warm", "dirty")
@@ -143,24 +146,84 @@ class WarmCommandsHarness(Harness):
             self.completion(restored, prepared=False, validation="retained")
 
         with self.step(
-            "native failure invalidates warm eligibility until reconciliation"
+            "repeated runtime failures preserve warm retention and their exit status"
         ):
+            # Earlier source edits rebuilt the application binary only. Prepare
+            # the distinct test target before measuring delivery-free failures.
+            self.public(
+                self.a,
+                "tests-after-source-restoration",
+                "test",
+                "-p",
+                "application",
+                "--lib",
+            )
             environment = self.environment | {
                 "CARGO_DYNDRV_TEST_RUNTIME_NAMES": "CARGO_DYNDRV_EXPECTED_MISSING_VALUE"
             }
             environment.pop("CARGO_DYNDRV_EXPECTED_MISSING_VALUE", None)
-            self.public(
+            for index in range(3):
+                _, failed = self.public(
+                    self.a,
+                    f"runtime-failure-{index}",
+                    "run",
+                    "-p",
+                    "application",
+                    env=environment,
+                    expected=101,
+                )
+                self.completion(
+                    failed, prepared=False, validation="retained", status=101
+                )
+                _, failed_tests = self.public(
+                    self.a,
+                    f"test-failure-{index}",
+                    "test",
+                    "-p",
+                    "application",
+                    "--lib",
+                    env=environment,
+                    expected=100,
+                )
+                self.completion(
+                    failed_tests, prepared=False, validation="retained", status=100
+                )
+            recovered = self.run_value(self.a, "runtime-recovered", "dirty")
+            self.completion(recovered, prepared=False, validation="retained")
+            warm = self.run_value(self.a, "runtime-recovered-warm", "dirty")
+            self.completion(warm, prepared=False, validation="retained")
+
+        with self.step(
+            "compilation followed by failed tests retains new and old roots"
+        ):
+            source = self.a / "app/src/lib.rs"
+            source.write_text(
+                source.read_text() + "\n// Exercise changed failed tests.\n"
+            )
+            _, failed = self.public(
                 self.a,
-                "runtime-failure",
-                "run",
+                "changed-test-failure",
+                "test",
                 "-p",
                 "application",
+                "--lib",
                 env=environment,
-                expected=101,
+                expected=100,
             )
-            recovered = self.run_value(self.a, "runtime-recovered", "dirty")
-            self.completion(recovered, prepared=False, validation="full")
-            warm = self.run_value(self.a, "runtime-recovered-warm", "dirty")
+            self.completion(failed, prepared=True, validation="incremental", status=100)
+            _, repeated = self.public(
+                self.a,
+                "changed-test-failure-warm",
+                "test",
+                "-p",
+                "application",
+                "--lib",
+                env=environment,
+                expected=100,
+            )
+            self.completion(repeated, prepared=False, validation="retained", status=100)
+            self.run_value(self.a, "changed-test-recovered", "dirty")
+            warm = self.run_value(self.a, "changed-test-recovered-warm", "dirty")
             self.completion(warm, prepared=False, validation="retained")
 
         with self.step(

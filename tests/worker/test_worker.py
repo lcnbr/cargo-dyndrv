@@ -442,7 +442,12 @@ class ArtifactDeliveryTests(unittest.TestCase):
                     self.assertEqual(command[1], "nix-cargo")
                     worker.write_json(
                         Path(command[3]) / "cargo-result.json",
-                        {"version": 2, "status": 0, "nix_invocations": 0},
+                        {
+                            "version": 3,
+                            "status": 0,
+                            "nix_invocations": 0,
+                            "artifacts_complete": True,
+                        },
                     )
                     backend = json.loads((config.parent / "backend.json").read_text())
                     self.assertEqual(backend.pop("artifact_delivery"), policy)
@@ -532,11 +537,17 @@ class WorkerRetentionTests(unittest.TestCase):
                 os.environ, {"CARGO_HOME": str(self.directory / "home")}, clear=True
             )
         )
-        self.completion = {"version": 2, "status": 0, "nix_invocations": 0}
+        self.completion = {
+            "version": 3,
+            "status": 0,
+            "nix_invocations": 0,
+            "artifacts_complete": True,
+        }
         self.driver_failure = None
         self.during_driver = lambda: None
         self.snapshot_failure = None
         self.snapshots = 0
+        self.snapshot_paths = ["/nix/store/compiler-output"]
         self.hooks = {}
         self.extra_runtime = {}
 
@@ -568,7 +579,8 @@ class WorkerRetentionTests(unittest.TestCase):
             if self.snapshot_failure:
                 raise self.snapshot_failure
             worker.write_json(
-                Path(command[-1]), {"storePaths": ["/nix/store/compiler-output"]}
+                Path(command[command.index("--output") + 1]),
+                {"storePaths": self.snapshot_paths},
             )
         elif command[1] == "nix-cargo":
             target = config.parent / "stage/target"
@@ -644,12 +656,12 @@ class WorkerRetentionTests(unittest.TestCase):
         self.assertEqual(self.sources.return_value.prepare.call_count, 2)
         self.assertEqual(self.daemon.provision.call_count, 2)
 
-    def test_real_invocations_without_final_results_and_hooks_require_full_audit(self):
+    def test_real_invocations_collect_incrementally_but_hooks_require_full_audit(self):
         self.run_worker()
         # Completed negative compilers have no successful final result to scan.
         self.completion["nix_invocations"] = 1
         self.run_worker()
-        self.assertEqual(self.report["ownership_validation"], "full")
+        self.assertEqual(self.report["ownership_validation"], "incremental")
         self.completion["nix_invocations"] = 0
         self.hooks["check"] = [["post-hook", "argument"]]
         self.run_worker()
@@ -660,24 +672,23 @@ class WorkerRetentionTests(unittest.TestCase):
         self.assertEqual(self.report["ownership_validation"], "retained")
 
     def test_missing_or_malformed_completion_never_reuses_retention(self):
+        valid = self.completion.copy()
         for completion in (
             None,
             {},
             {"version": 1, "status": 0, "nix_invocations": 0},
-            *(
-                {"version": 2, "status": 0, "nix_invocations": value}
-                for value in (-1, True, 0.0, None)
-            ),
-            {"version": 2, "status": 256, "nix_invocations": 1},
+            *({**valid, "nix_invocations": value} for value in (-1, True, 0.0, None)),
+            *({**valid, "artifacts_complete": value} for value in (False, None, 1)),
+            {**valid, "version": 2},
+            {**valid, "status": 256},
+            {**valid, "status": 9},
         ):
             with self.subTest(completion=completion):
                 self.run_worker("clean")
-                self.completion = {"version": 2, "status": 0, "nix_invocations": 0}
+                self.completion = valid.copy()
                 self.run_worker()
                 self.completion = completion
-                with self.assertRaisesRegex(
-                    ValueError, "successful v2 Cargo completion"
-                ):
+                with self.assertRaisesRegex(ValueError, "complete v3 Cargo result"):
                     self.run_worker()
                 self.assertFalse(self.checkpoint.exists())
                 self.assertNotEqual(self.report["status"], 0)
@@ -746,6 +757,80 @@ class WorkerRetentionTests(unittest.TestCase):
         self.run_worker("clean")
         self.assertFalse(self.checkpoint.exists())
         self.assertTrue(session.exists())
+
+    def test_completed_runtime_failure_preserves_retention_and_failure_status(self):
+        self.run_worker()
+        self.completion["status"] = 100 << 8
+        self.driver_failure = subprocess.CalledProcessError(100, "nextest")
+        for _ in range(3):
+            self.daemon.retain.reset_mock()
+            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                self.run_worker("test")
+            self.assertEqual(failure.exception.returncode, 100)
+            self.assertEqual(self.report["status"], 100)
+            self.assertEqual(self.report["ownership_validation"], "retained")
+            self.assertTrue(self.checkpoint.exists())
+            self.assertFalse((self.policy / "in-progress.json").exists())
+            self.daemon.retain.assert_not_called()
+        self.assertEqual(self.snapshots, 1)
+        self.driver_failure = None
+        self.completion["status"] = 0
+        self.run_worker()
+        self.assertEqual(self.report["ownership_validation"], "retained")
+
+    def test_changed_compiler_failure_collects_incrementally_and_never_prunes(self):
+        self.run_worker()
+        roots = Path(json.loads(self.checkpoint.read_text())["roots"]["path"])
+        self.snapshot_paths = ["/nix/store/new-compiler-output"]
+        self.completion.update(status=100 << 8, nix_invocations=1)
+        self.driver_failure = subprocess.CalledProcessError(100, "nextest")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_worker("test")
+        self.assertEqual(self.report["ownership_validation"], "incremental")
+        self.assertTrue(self.checkpoint.exists())
+        self.assertTrue((roots / "compiler-output").is_symlink())
+        self.assertTrue((roots / "new-compiler-output").is_symlink())
+        self.assertEqual(self.namespace.call_args.args[1][-1], "--incremental")
+
+    def test_failed_command_without_checkpoint_or_complete_delivery_cannot_reuse(self):
+        for incomplete in (False, True):
+            with self.subTest(incomplete=incomplete):
+                self.run_worker("clean")
+                self.driver_failure = None
+                self.completion.update(status=0, artifacts_complete=True)
+                self.run_worker()
+                if not incomplete:
+                    self.checkpoint.unlink()
+                self.completion.update(
+                    status=100 << 8, artifacts_complete=not incomplete
+                )
+                self.driver_failure = subprocess.CalledProcessError(100, "nextest")
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.run_worker("test")
+                self.assertFalse(self.checkpoint.exists())
+                self.assertNotIn("ownership_validation", self.report)
+
+    def test_signal_cannot_reuse_even_with_forged_complete_flag(self):
+        self.run_worker()
+        self.completion.update(status=9, artifacts_complete=True)
+        self.driver_failure = subprocess.CalledProcessError(-9, "driver")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_worker()
+        self.assertFalse(self.checkpoint.exists())
+
+    def test_replaced_target_during_compilation_requires_full_validation(self):
+        self.run_worker()
+        self.completion["nix_invocations"] = 1
+
+        def replace_target():
+            target = self.policy / "stage/target"
+            saved = target.with_name("old-target")
+            target.rename(saved)
+            shutil.copytree(saved, target, symlinks=True)
+
+        self.during_driver = replace_target
+        self.run_worker()
+        self.assertEqual(self.report["ownership_validation"], "full")
 
     def test_audit_uses_successful_stored_session_without_staging_and_keeps_extra_roots(
         self,

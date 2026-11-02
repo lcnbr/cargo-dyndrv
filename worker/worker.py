@@ -945,26 +945,48 @@ class Worker:
         return {"version": 1, **identity}
 
     @staticmethod
-    def completed_invocations(session):
+    def completed_invocations(session, *, status=0):
         try:
             completion = json.loads((session / "cargo-result.json").read_text())
         except (OSError, ValueError) as error:
             raise ValueError(
-                "dyndrv requires a successful v2 Cargo completion"
+                "dyndrv requires a complete v3 Cargo result matching the command status"
             ) from error
         if (
             not isinstance(completion, dict)
             or type(completion.get("version")) is not int
-            or completion["version"] != 2
+            or completion["version"] != 3
             or type(completion.get("status")) is not int
-            or completion["status"] != 0
+            or not 0 <= status <= 255
+            or completion["status"] != status << 8
+            or completion.get("artifacts_complete") is not True
             or type(completion.get("nix_invocations")) is not int
             or completion["nix_invocations"] < 0
         ):
-            raise ValueError("dyndrv requires a successful v2 Cargo completion")
+            raise ValueError(
+                "dyndrv requires a complete v3 Cargo result matching the command status"
+            )
         return completion["nix_invocations"]
 
-    def snapshot_references(self, namespace_config, session, timings):
+    def retention_mode(self, retained, target, owner, invocations):
+        if retained is None or self.spec.get("post_commands", {}).get(self.action):
+            return "full"
+        current = self._retention_identity(target, owner)
+        if current is None or (target / ".dyndrv-delivered/rejected").exists():
+            return "full"
+        if invocations == 0:
+            return "retained" if current == retained else "full"
+        # Compiler delivery changes directory timestamps. Incremental collection
+        # still requires the same owned directories, and preserves every old root.
+        for name in ("target", "ownership", "roots"):
+            for key in ("path", "device", "inode", "mode", "uid", "gid"):
+                if current[name][key] != retained[name][key]:
+                    return "full"
+        return "incremental"
+
+    def snapshot_references(
+        self, namespace_config, session, timings, *, incremental=False
+    ):
         references = namespace_config.parent / (
             "references-" + uuid.uuid4().hex + ".json"
         )
@@ -978,6 +1000,7 @@ class Worker:
                     str(session),
                     "--output",
                     str(references),
+                    *(["--incremental"] if incremental else []),
                 ],
             )
             return set(json.loads(references.read_text())["storePaths"])
@@ -1146,7 +1169,7 @@ class Worker:
                 retained = None
             if retained != self._retention_identity(target, owner):
                 retained = None
-            # Any failed attempt must reconcile before it can reuse retention.
+            # Only completed, retained commands may publish another checkpoint.
             checkpoint.unlink(missing_ok=True)
             session = directory / "sessions" / uuid.uuid4().hex
             record = {
@@ -1384,32 +1407,49 @@ class Worker:
                 ]
                 print(f"dyndrv session: {session}", file=sys.stderr)
                 write_json(in_progress, {"session": str(session)})
+                retention_completed = False
                 try:
-                    with timings.phase("driver"):
-                        self.run_namespace(namespace_config, command)
-                    invocations = self.completed_invocations(session)
+                    driver_failure = None
+                    try:
+                        with timings.phase("driver"):
+                            self.run_namespace(namespace_config, command)
+                    except subprocess.CalledProcessError as error:
+                        driver_failure = error
+                    status = driver_failure.returncode if driver_failure else 1
+                    try:
+                        invocations = self.completed_invocations(
+                            session,
+                            status=driver_failure.returncode if driver_failure else 0,
+                        )
+                    except ValueError:
+                        if driver_failure is not None:
+                            raise driver_failure
+                        raise
                     record["nix_invocations"] = invocations
-                    with timings.phase("post_commands"):
-                        self.run_post_commands(namespace_config, layout)
-                    if (
-                        invocations == 0
-                        and retained is not None
-                        and not self.spec.get("post_commands", {}).get(self.action)
-                        and retained == self._retention_identity(target, owner)
-                    ):
-                        record["ownership_validation"] = "retained"
-                    else:
+                    if driver_failure is None:
+                        with timings.phase("post_commands"):
+                            self.run_post_commands(namespace_config, layout)
+                    mode = self.retention_mode(retained, target, owner, invocations)
+                    if driver_failure is not None and mode == "full":
+                        raise driver_failure
+                    if mode != "retained":
                         references = self.snapshot_references(
-                            namespace_config, session, timings
+                            namespace_config,
+                            session,
+                            timings,
+                            incremental=mode == "incremental",
                         )
                         with timings.phase("retain"):
                             self.daemon.retain(
                                 sorted(references | set(runtime_inputs)),
                                 owner,
-                                replace=True,
+                                replace=mode == "full",
                             )
-                        record["ownership_validation"] = "full"
+                    record["ownership_validation"] = mode
+                    retention_completed = True
                     in_progress.unlink(missing_ok=True)
+                    if driver_failure is not None:
+                        raise driver_failure
                     if self.action in {"build", "run"}:
                         with timings.phase("install_binaries"):
                             self.install_binaries(
@@ -1418,6 +1458,8 @@ class Worker:
                     status = 0
                 except subprocess.CalledProcessError as error:
                     status = error.returncode
+                    if retention_completed:
+                        raise
                     try:
                         with timings.phase("retain"):
                             self.retain_failed(session, target, owner)
@@ -1440,6 +1482,7 @@ class Worker:
                         )
                     raise
                 except BaseException as error:
+                    retention_completed = False
                     if isinstance(error, SystemExit):
                         status = error.code if isinstance(error.code, int) else 1
                     rejected = target / ".dyndrv-delivered/rejected"
@@ -1468,9 +1511,10 @@ class Worker:
                     if reports.exists():
                         destination = workspace / "target/test-reports/dyndrv"
                         shutil.copytree(reports, destination, dirs_exist_ok=True)
-                identity = self._retention_identity(target, owner)
-                if identity is not None:
-                    write_json(checkpoint, identity)
+                    if retention_completed:
+                        identity = self._retention_identity(target, owner)
+                        if identity is not None:
+                            write_json(checkpoint, identity)
             return 0
 
 

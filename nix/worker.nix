@@ -16,6 +16,7 @@ let
       (pythonFiles ../worker)
       ../tests/worker/test_sources.py
       ../tests/worker/test_worker.py
+      ../tests/worker/test_evidence.py
     ];
   };
   testsSource = lib.fileset.toSource {
@@ -43,8 +44,11 @@ runCommand "cargo-dyndrv-worker"
     export PYTHONDONTWRITEBYTECODE=1
     python3 ${source}/tests/worker/test_sources.py
     python3 ${source}/tests/worker/test_worker.py
+    python3 ${source}/tests/worker/test_evidence.py
     mkdir -p "$out/share/cargo-dyndrv" "$out/bin"
     cp ${source}/worker/*.py "$out/share/cargo-dyndrv/"
     makeWrapper ${python}/bin/python3 "$out/bin/cargo-dyndrv-worker" \
       --add-flags "$out/share/cargo-dyndrv/worker.py"
+    makeWrapper ${python}/bin/python3 "$out/bin/cargo-dyndrv-evidence" \
+      --add-flags "$out/share/cargo-dyndrv/evidence.py"
   ''

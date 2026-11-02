@@ -107,7 +107,8 @@ incremental state, still determine reuse; no end-to-end speedup is promised.
 owned, mode `0700`, and outside the selected source roots. Workspaces and build
 policies have separate targets and locks; immutable compiler outputs can be shared.
 Failed compiles retain completed dependency outputs and incremental backing.
-Failures invalidate warm retention reuse.
+Completed commands can retain reusable ownership even when tests or the launched
+program fail. Missing or incomplete delivery invalidates warm retention reuse.
 Interrupted/rejected targets require the explicit `clean` action before reuse.
 
 `CARGO_DYNDRV_STORE` selects `private` or `system`. The optional
@@ -126,10 +127,15 @@ timestamps; secrets, VCS state, build products and virtual environments are
 excluded. Safe selected symlinks are materialized; escaping, ignored and special
 files are rejected before modifying the old stage. Path declarations are rewritten
 for the stable namespace. The worker does not mutate the original manifests.
-Source staging always runs before Cargo, including on warm commands, and compares
-selected contents so changed bytes are staged even when their modification time
-is unchanged. Cargo therefore sees the current staged sources before deciding
-which compilers to invoke.
+Source staging always inventories sources before Cargo, including warm commands.
+An atomic stage-local signature cache avoids rereading unchanged regular files
+only when both source and staged device/inode, size, mode, link count, modification
+and change times still match. File identity includes the resolved source path.
+Observations in the same coarse timestamp interval are reread; manifests and
+Cargo configuration are always reread and rewritten for the namespace. Changed
+bytes are staged even when an editor restores their modification time. Deletions,
+retargeted aliases, and staged-file changes still trigger reconciliation before
+Cargo decides which compilers to invoke.
 
 Compiler source capture and import are deferred until the session's first real,
 non-probe compiler invocation. That invocation freezes the session's compiler
@@ -167,9 +173,12 @@ identities and byte validation remain unchanged.
 
 == Retention and auditing
 
-Successful warm commands reuse established GC roots by default when the current
-`cargo-result.json` is version 2, has successful raw `status = 0`, and records
-`nix_invocations = 0`. The count must be a nonnegative integer and counts real,
+Warm commands reuse established GC roots by default when the current
+`cargo-result.json` is version 3, its raw `status` matches the command's ordinary
+exit code, `artifacts_complete = true`, and `nix_invocations = 0`.
+Test/program failures keep their original exit code and do not imply successful
+compilation or tests. Signals and unfinished wrapper deliveries cannot authorize
+reuse. The count must be a nonnegative integer and counts real,
 non-probe Nix compiler observations, including completed negative compiler
 invocations whose failure a build script accepts. Native rustdoc and native
 compiler probes do not count. Missing, older or malformed completion evidence
@@ -179,12 +188,24 @@ Reuse also requires the policy's private `retention.json` checkpoint to match
 the target, `.dyndrv-delivered` and GC roots directories: their paths, device/inode
 identities, ownership, mode and modification/change times. Directory-entry changes
 conservatively force reconciliation; runtime-owned file contents may still change.
-The checkpoint records a
-successful full snapshot and retention; it does not certify every descendant's
-current bytes. A first command, restored target, missing checkpoint, replaced
-directory or changed roots directory requires full snapshot and retention.
-Any real compiler invocation or nonempty `post_commands` list for the current
-action also requires the full path. Failures invalidate the checkpoint;
+The checkpoint records established retention; it does not certify every
+descendant's current bytes. A first command, restored target, missing checkpoint,
+replaced directory, or changed directory identity during a delivery-free command
+requires full snapshot and retention. Nonempty `post_commands` for the current
+action also require the full path.
+
+After real compiler invocations, a valid pre-run checkpoint and unchanged
+directory identities/ownership permit incremental reference collection. Directory
+timestamps may change during delivery. This mode scans receipt structure and
+immutable backing existence, skipping repeated comparisons of mutable artifact
+bytes and recursive incremental-state payloads. Its references are unioned with
+existing roots; it never prunes old roots. Explicit audit still validates all
+payloads, and actual compiler input consumption keeps its existing checks.
+`ownership_validation` reports `full`, `incremental`, or `retained` accordingly.
+
+Ordinary failed commands may preserve the checkpoint only through the retained
+or incremental path with complete matching delivery evidence. Otherwise partial
+outputs are conservatively rooted without publishing a checkpoint;
 interrupted ownership retention still requires `clean`. Clean removes the
 checkpoint along with that policy's target and roots. Arbitrary out-of-band
 receipt or root rewrites are outside the supported worker ownership contract;
@@ -205,7 +226,8 @@ Full artifact snapshots reuse each parsed receipt and deduplicate exact immutabl
 backing-path checks within that snapshot. Every mutable owned artifact receives
 a full byte comparison, and incremental backing validation is unchanged. Parsed
 receipts and artifact-validity results are not cached across snapshots; the
-worker checkpoint only permits skipping the snapshot on eligible warm commands.
+worker checkpoint authorizes retained or incremental collection, not a claim of
+unchanged payload bytes.
 With `system-store-rlib-links`, eligible owned links are checked for exact backing,
 representation and protected-store identity instead of rereading their payloads.
 Receipt completion, transitive owners and GC roots remain required. Replacing a
@@ -232,16 +254,24 @@ source trees and builder input after the first real compiler prepares them. This
 file is optional: it is absent when no compiler preparation was needed or when
 preparation did not complete. Readers of session configuration must not assume
 compiler preparation occurred or look for its fields inside `.nix`.
-`cargo-result.json` version 2 contains `version`, `status` and `nix_invocations`;
+`cargo-result.json` version 3 contains `version`, `status`, `nix_invocations` and
+`artifacts_complete`;
 `status` retains the existing raw process wait status, not a decoded exit code.
 
-Successful `last-run.json` records include `action`, `nix_invocations` from that
-completion and `ownership_validation = "full"` or `"retained"`. The worker's
+Completed retained `last-run.json` records include `action`, `nix_invocations`
+from that completion and `ownership_validation = "full"`, `"incremental"` or
+`"retained"`. The worker's
 `status` is its command exit code, unlike the raw wait status in
 `cargo-result.json`. A retained run omits `snapshot_references` and `retain` from
 `phase_seconds`; runtime provisioning still runs. Audit records `action = "audit"`
 and `ownership_validation = "full"` using the prior successful session and its
 compiler count. Its timings describe the audit, not another Cargo execution.
+
+Use the packaged `cargo-dyndrv-evidence` command to seal explicitly declared
+existing files, bind source/run/compiler/test records and validate completion
+gates before publishing a packet. See #link("evidence.typ")[Evidence packaging]
+for its specification and commands. It performs no scientific work and does not
+turn a failing test into a successful result.
 
 Staged commands record `last-run.json` once their workspace target passes the
 interrupted-command check. Failures before this point, including initial metadata

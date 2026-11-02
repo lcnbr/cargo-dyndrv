@@ -1,5 +1,6 @@
 //! Process-boundary controls for the unmodified-Cargo driver. Real Cargo coverage
 //! is measured separately; these isolate argv, IO, descriptors and failure status.
+use libc::SIGTERM;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -289,8 +290,40 @@ fn valid_noop_queries_and_native_documentation_never_prepare_compiler_inputs() {
         .unwrap();
         assert_eq!(
             completion,
-            serde_json::json!({"version":2, "status":0, "nix_invocations":0})
+            serde_json::json!({"version":3, "status":0, "nix_invocations":0, "artifacts_complete":true})
         );
+    }
+}
+
+#[test]
+fn failed_native_doctests_finish_delivery_but_signals_remain_incomplete() {
+    for (name, body, complete) in [
+        ("failed", "exit 23\n", true),
+        ("signalled", "kill -TERM $$\n", false),
+    ] {
+        let fixture = Fixture::new();
+        let (listener, config) = fixture.nix_config();
+        let rustdoc = fixture.script("rustdoc", body);
+        let result = fixture
+            .nix_cargo(name, &config, &rustdoc)
+            .args(["rustdoc", "--test", "lib.rs"])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        fixture.assert_unprepared(name, &listener);
+        let completion: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.0.join(name).join("cargo-result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(completion["version"], 3);
+        assert_eq!(completion["nix_invocations"], 0);
+        assert_eq!(completion["artifacts_complete"], complete);
+        assert_eq!(completion["status"], result.status.into_raw());
+        if complete {
+            assert_eq!(result.status.code(), Some(23));
+        } else {
+            assert_eq!(result.status.signal(), Some(SIGTERM));
+        }
     }
 }
 
@@ -376,7 +409,7 @@ fn swallowed_lazy_initialization_failure_is_counted_and_rejects_the_target() {
         serde_json::from_slice(&fs::read(root.join("cargo-result.json")).unwrap()).unwrap();
     assert_eq!(
         completion,
-        serde_json::json!({"version":2, "status":256, "nix_invocations":1})
+        serde_json::json!({"version":3, "status":256, "nix_invocations":1, "artifacts_complete":false})
     );
     assert!(!root.join("compiler-inputs.json").exists());
     assert!(

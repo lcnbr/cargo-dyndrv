@@ -2,7 +2,7 @@
 //! execution; Nix mode binds actual commands to immutable compiler inputs. Cargo
 //! retains command construction, scheduling, build scripts and target ownership.
 mod nix;
-use self::nix::Backend;
+use self::nix::{Backend, SnapshotMode};
 use color_eyre::eyre;
 use color_eyre::eyre::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,9 @@ struct Completion {
     version: u32,
     status: i32,
     nix_invocations: u64,
+    // Delivery completeness is independent of compiler success: a completed
+    // negative capability probe also owns its artifacts.
+    artifacts_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -57,6 +60,18 @@ impl Execution {
             Self::NativeDoctest | Self::NativeRustdoc => Some(("native-complete", b"executed\n")),
             Self::NativeProbe | Self::NativeExecNotNix => None,
         }
+    }
+
+    fn record_completion(self, observation: &Path, status: ExitStatus) -> eyre::Result<()> {
+        // A completed negative capability probe can own artifacts, but a
+        // signalled compiler cannot authorize retention even if Cargo later
+        // reports an ordinary exit (usually 101).
+        if status.code().is_some()
+            && let Some((extension, marker)) = self.completion()
+        {
+            fs::write(observation.with_extension(extension), marker)?;
+        }
+        Ok(())
     }
 }
 
@@ -168,9 +183,7 @@ impl Session {
                     "seconds": started.elapsed().as_secs_f64(),
                 }))?,
             )?;
-            if status.success() {
-                fs::write(destination.with_extension("native-complete"), b"executed\n")?;
-            }
+            execution.record_completion(&destination, status)?;
             Self::exit(status);
         }
         if let Some(backend) = session.nix
@@ -180,7 +193,7 @@ impl Session {
             let status = backend.execute(&destination, program, arguments, role)?;
             // Build scripts may swallow wrapper failures as negative capability
             // probes. Only completed delivery permits the outer Cargo success.
-            fs::write(destination.with_extension("nix-complete"), b"delivered\n")?;
+            execution.record_completion(&destination, status)?;
             Self::exit(status);
         }
         // exec preserves Cargo's descriptors, stdin, streaming output, signals,
@@ -213,8 +226,7 @@ impl Session {
             if execution == Execution::NixCompiler {
                 nix_invocations += 1;
             }
-            if status.as_ref().is_ok_and(ExitStatus::success)
-                && let Some((extension, expected)) = execution.completion()
+            if let Some((extension, expected)) = execution.completion()
                 && fs::read(path.with_extension(extension)).ok().as_deref() != Some(expected)
             {
                 incomplete.get_or_insert(path);
@@ -228,16 +240,20 @@ impl Session {
         Backend::write_json(
             &root.join("cargo-result.json"),
             &Completion {
-                version: 2,
-                status: if incomplete.is_some() {
+                version: 3,
+                status: if incomplete.is_some() && status.as_ref().is_ok_and(ExitStatus::success) {
                     1 << 8
                 } else {
                     status.as_ref().map_or(1 << 8, |status| status.into_raw())
                 },
                 nix_invocations,
+                artifacts_complete: incomplete.is_none()
+                    && status.as_ref().is_ok_and(|status| status.code().is_some()),
             },
         )?;
-        if let Some(path) = incomplete {
+        if let Some(path) = incomplete
+            && status.as_ref().is_ok_and(ExitStatus::success)
+        {
             bail!(
                 "Cargo succeeded after an incomplete Nix compiler invocation: {}; a build script may have swallowed a backend error",
                 path.display()
@@ -247,9 +263,15 @@ impl Session {
     }
 
     fn snapshot_references(arguments: &[OsString]) -> eyre::Result<()> {
+        let (arguments, mode) = match arguments.split_last() {
+            Some((flag, arguments)) if flag == "--incremental" => {
+                (arguments, SnapshotMode::Incremental)
+            }
+            _ => (arguments, SnapshotMode::Audit),
+        };
         let [directory, root, output, destination] = arguments else {
             bail!(
-                "usage: snapshot-references --directory COMPLETED_NIX_SESSION --output NEW_JSON_FILE"
+                "usage: snapshot-references --directory COMPLETED_NIX_SESSION --output NEW_JSON_FILE [--incremental]"
             );
         };
         if directory != "--directory" || output != "--output" {
@@ -267,15 +289,23 @@ impl Session {
         let session: Self = serde_json::from_slice(&fs::read(root.join("session.json"))?)?;
         let completion: Completion =
             serde_json::from_slice(&fs::read(root.join("cargo-result.json"))?)?;
-        if session.version != 2 || completion.version != 2 || completion.status != 0 {
-            bail!("snapshot references require a successfully completed Cargo session");
+        let status = ExitStatus::from_raw(completion.status);
+        if session.version != 2
+            || completion.version != 3
+            || !completion.artifacts_complete
+            || status.code().is_none()
+            || (mode == SnapshotMode::Audit && !status.success())
+        {
+            bail!(
+                "snapshot references require complete artifact delivery and a successful session for full audit"
+            );
         }
         let backend = session
             .nix
             .ok_or_else(|| eyre::eyre!("snapshot references require Nix artifact ownership"))?;
         // Reuse the completed session's owner. Do not prepare another source
         // import, contact a daemon or realize an absent backing output.
-        Backend::write_json(Path::new(destination), &backend.snapshot_references()?)
+        Backend::write_json(Path::new(destination), &backend.snapshot_references(mode)?)
     }
 
     fn exit(status: ExitStatus) -> ! {
@@ -372,6 +402,7 @@ fn capture(arguments: &[OsString], use_nix: bool) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libc::SIGTERM;
 
     struct Fixture(PathBuf);
 
@@ -448,9 +479,10 @@ mod tests {
         }
         assert!(fixture.run(0).unwrap().success());
         let completion = fixture.completion();
-        assert_eq!(completion.version, 2);
+        assert_eq!(completion.version, 3);
         assert_eq!(completion.status, 0);
         assert_eq!(completion.nix_invocations, 2);
+        assert!(completion.artifacts_complete);
         assert!(
             fixture.run(0).is_err(),
             "completed sessions cannot be reused"
@@ -476,6 +508,7 @@ mod tests {
             let completion = fixture.completion();
             assert_ne!(completion.status, 0);
             assert_eq!(completion.nix_invocations, 1);
+            assert!(!completion.artifacts_complete);
         }
     }
 
@@ -493,6 +526,79 @@ mod tests {
         assert_eq!(fixture.run(23).unwrap().code(), Some(23));
         assert_eq!(fixture.completion().status, 23 << 8);
         assert_eq!(fixture.completion().nix_invocations, 1);
+        assert!(!fixture.completion().artifacts_complete);
+    }
+
+    #[test]
+    fn failed_commands_report_delivery_completeness_without_claiming_compiler_success() {
+        for execution in [
+            Execution::NixCompiler,
+            Execution::NativeRustdoc,
+            Execution::NativeDoctest,
+        ] {
+            let fixture = Fixture::new();
+            let path = fixture.record("completed", execution);
+            let (extension, marker) = execution.completion().unwrap();
+            fs::write(path.with_extension(extension), marker).unwrap();
+            assert_eq!(fixture.run(23).unwrap().code(), Some(23));
+            assert_eq!(fixture.completion().status, 23 << 8);
+            assert!(fixture.completion().artifacts_complete);
+        }
+        let fixture = Fixture::new();
+        assert_eq!(fixture.run(23).unwrap().code(), Some(23));
+        assert!(fixture.completion().artifacts_complete);
+        assert_eq!(fixture.completion().nix_invocations, 0);
+    }
+
+    #[test]
+    fn interrupted_cargo_preserves_signal_and_cannot_authorize_retention() {
+        let fixture = Fixture::new();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "kill -TERM $$"]);
+        let status = Session {
+            version: 2,
+            rustdoc: vec![],
+            nix: None,
+        }
+        .run_cargo(&fixture.0, &mut command)
+        .unwrap();
+        assert_eq!(status.signal(), Some(SIGTERM));
+        assert_eq!(fixture.completion().status, status.into_raw());
+        assert!(!fixture.completion().artifacts_complete);
+    }
+
+    #[test]
+    fn signalled_compiler_cannot_complete_delivery_when_cargo_exits_normally() {
+        for (command, complete) in [("exit 23", true), ("kill -TERM $$", false)] {
+            let fixture = Fixture::new();
+            let observation = fixture.record("compiler", Execution::NixCompiler);
+            let compiler_status = Command::new("/bin/sh")
+                .args(["-c", command])
+                .status()
+                .unwrap();
+            Backend::write_json(
+                &observation.with_extension("nix-result.json"),
+                &serde_json::json!({"compilerStatus": compiler_status.into_raw()}),
+            )
+            .unwrap();
+            // Exercise the same terminal delivery boundary as the Nix wrapper:
+            // a result record exists before deciding whether to publish a marker.
+            Execution::NixCompiler
+                .record_completion(&observation, compiler_status)
+                .unwrap();
+            assert_eq!(
+                observation.with_extension("nix-complete").exists(),
+                complete
+            );
+            assert_eq!(fixture.run(101).unwrap().code(), Some(101));
+            let completion = fixture.completion();
+            assert_eq!(completion.status, 101 << 8);
+            assert_eq!(completion.nix_invocations, 1);
+            assert_eq!(completion.artifacts_complete, complete);
+            if !complete {
+                assert_eq!(compiler_status.signal(), Some(SIGTERM));
+            }
+        }
     }
 
     #[test]
@@ -507,6 +613,7 @@ mod tests {
         assert!(session.run_cargo(&fixture.0, &mut command).is_err());
         assert_eq!(fixture.completion().status, 1 << 8);
         assert_eq!(fixture.completion().nix_invocations, 0);
+        assert!(!fixture.completion().artifacts_complete);
     }
 
     #[test]
@@ -541,9 +648,10 @@ mod tests {
             Backend::write_json(
                 &root.join("cargo-result.json"),
                 &Completion {
-                    version: 2,
+                    version: 3,
                     status,
                     nix_invocations: 0,
+                    artifacts_complete: true,
                 },
             )
             .unwrap();
